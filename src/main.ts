@@ -10,8 +10,10 @@
 //  • Clock reference = the SERVER (/api/time), not the host → host can sleep/leave.
 //  • Schedule lives on the server (Netlify Blobs) → late joiners & recovering devices
 //    just re-read it; the host is NOT a live coordinator.
-//  • Every device (host included) runs the SAME local "follow" loop, self-correcting to
-//    the derived position. Only the host may CHANGE the schedule.
+//  • EVENT-DRIVEN, not a loop: each action becomes a schedule that executes a moment in the
+//    future; every device (host included) does ONE apply at that instant, then plays
+//    untouched. Re-sync happens only on join, action, resume, or a buffer stall — so there's
+//    no constant correction to cause jitter. Only the host may CHANGE the schedule.
 //  • LiveKit is used only for instant push of schedule changes + presence + admission.
 // -----------------------------------------------------------------------------
 
@@ -26,9 +28,17 @@ import './style.css';
 
 const CTRL = 'smp-ctrl';
 const SEEK_SECONDS = 10;
-const FOLLOW_MS = 1000; // how often each device self-corrects to the timeline
+const SAME_LEAD = 700; // ms — actions execute this far in the future, so ALL devices fire together
+const TRACK_LEAD = 1500; // ms — track change: extra time to buffer the new file
+const CLOCK_REFRESH_MS = 30000; // occasional clock re-sync (does NOT touch audio)
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+
+// iPadOS reports as MacIntel + touch. iOS can't route audio through Web Audio (it suspends
+// in the background), so reactive bars are desktop/Android only; iOS uses the sine fallback.
+const isIOS =
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
@@ -42,6 +52,8 @@ interface AppState {
   party: Party | null;
   hostPassword: string;
   audioEl: HTMLAudioElement | null;
+  audioCtx: AudioContext | null; // visualizer only (non-iOS)
+  graphReady: boolean;
   playlist: Track[];
   currentIndex: number;
   seeking: boolean;
@@ -54,8 +66,8 @@ interface AppState {
   admitted: boolean; // listener has been let in by the host
   ended: boolean; // party ended
   loadedKey: string | null; // track key currently loaded into the audio element
-  correcting: boolean; // currently nudging playbackRate (hysteresis flag)
-  driftStrikes: number; // consecutive over-deadband readings (debounce)
+  applyTimer: number; // pending one-shot "execute this action at T" timer
+  lastClockSync: number; // Date.now() of last server-time ping
   timers: number[];
 }
 
@@ -68,6 +80,8 @@ const state: AppState = {
   party: null,
   hostPassword: '',
   audioEl: null,
+  audioCtx: null,
+  graphReady: false,
   playlist: [],
   currentIndex: -1,
   seeking: false,
@@ -80,8 +94,8 @@ const state: AppState = {
   admitted: false,
   ended: false,
   loadedKey: null,
-  correcting: false,
-  driftStrikes: 0,
+  applyTimer: 0,
+  lastClockSync: 0,
   timers: []
 };
 
@@ -177,15 +191,6 @@ $('#app').innerHTML = /* html */ `
       multiple hidden />
   </main>
 
-  <!-- Listener gesture unlock (mobile autoplay) -->
-  <div id="unmuteOverlay" class="overlay" hidden>
-    <div class="overlay-card">
-      <div class="overlay-icon">🔊</div>
-      <h2>Join the party</h2>
-      <p>Tap to start playing in sync with everyone.</p>
-      <button id="unmuteBtn" class="btn-primary big">Tap to Listen in Sync</button>
-    </div>
-  </div>
 
   <!-- Listener waiting room (until host admits) -->
   <div id="waitingOverlay" class="overlay" hidden>
@@ -322,6 +327,11 @@ async function join(name: string, isHost: boolean, password: string) {
   err.hidden = true;
   if (!state.party || !name) return;
 
+  // CRITICAL (mobile autoplay): create + unlock the audio element NOW, inside the click
+  // gesture (before any await). Once an element has played via a gesture, iOS/Android let
+  // us play it programmatically later — so we never need a "tap to start" popup.
+  unlockAudio();
+
   state.myName = name;
   state.isHost = isHost;
   state.hostPassword = password;
@@ -336,6 +346,75 @@ async function join(name: string, isHost: boolean, password: string) {
     err.hidden = false;
     refreshEnter();
   }
+}
+
+// Build the audio element and bless it within the user gesture (plays a tiny silent clip).
+function unlockAudio() {
+  if (state.audioEl) return;
+  const a = new Audio();
+  a.crossOrigin = 'anonymous'; // R2 CORS-friendly fetch
+  a.preload = 'auto';
+  (a as any).playsInline = true;
+  state.audioEl = a;
+  state.unlocked = true;
+
+  // Tiny silent WAV so the very first play() happens during the gesture.
+  try {
+    a.src = silentWavUrl();
+    a.muted = true;
+    a.play()
+      .then(() => {
+        a.pause();
+        a.currentTime = 0;
+        a.muted = false;
+      })
+      .catch(() => {
+        a.muted = false;
+      });
+  } catch {
+    /* ignore */
+  }
+
+  // Non-iOS: set up the analyser graph for reactive bars (audio still audible).
+  if (!isIOS) {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      state.audioCtx = ctx;
+      const src = ctx.createMediaElementSource(a);
+      const analyser = ctx.createAnalyser();
+      src.connect(analyser);
+      src.connect(ctx.destination);
+      viz.connect(analyser);
+      state.graphReady = true;
+    } catch (e) {
+      console.warn('Reactive visualizer unavailable:', e);
+    }
+  }
+}
+
+function silentWavUrl() {
+  const sr = 8000;
+  const n = Math.floor(sr * 0.2);
+  const buf = new ArrayBuffer(44 + n);
+  const dv = new DataView(buf);
+  const wr = (o: number, s: string) => {
+    for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i));
+  };
+  wr(0, 'RIFF');
+  dv.setUint32(4, 36 + n, true);
+  wr(8, 'WAVE');
+  wr(12, 'fmt ');
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true);
+  dv.setUint32(24, sr, true);
+  dv.setUint32(28, sr, true);
+  dv.setUint16(32, 1, true);
+  dv.setUint16(34, 8, true);
+  wr(36, 'data');
+  dv.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) dv.setUint8(44 + i, 128); // 8-bit silence
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 
 async function connect(url: string, token: string) {
@@ -371,14 +450,7 @@ async function connect(url: string, token: string) {
 
   await room.connect(url, token);
 
-  // Shared audio element. Plain <audio> = background-friendly on every platform.
-  const audioEl = new Audio();
-  audioEl.crossOrigin = 'anonymous'; // R2 CORS-friendly fetch
-  audioEl.preload = 'auto';
-  // Keep pitch stable during the tiny rate nudges we use for correction.
-  (audioEl as any).preservesPitch = true;
-  (audioEl as any).webkitPreservesPitch = true;
-  state.audioEl = audioEl;
+  // (audioEl was created + unlocked in join(), within the user gesture.)
 
   // Common header.
   $('#landing').hidden = true;
@@ -414,7 +486,8 @@ async function connect(url: string, token: string) {
   }
 }
 
-// Listener: enter the player once the host admits us.
+// Listener: enter the player once the host admits us. No "tap to sync" popup — we already
+// unlocked audio on the join gesture, so we just apply the timeline and play.
 async function admitListener(hostIdentity: string) {
   if (state.admitted) return;
   state.admitted = true;
@@ -423,10 +496,8 @@ async function admitListener(hostIdentity: string) {
   $('#player').hidden = false;
   await refreshPlaylist();
   setupListener();
-  const got = await api.getSchedule(state.party!.id).catch(() => null);
-  if (got) applySchedule(got.schedule);
   setupMediaSession();
-  state.timers.push(window.setInterval(follow, FOLLOW_MS));
+  await resync(); // fetch the schedule + clock, then apply once → instantly in sync
 }
 
 // -----------------------------------------------------------------------------
@@ -464,7 +535,7 @@ function onData(payload: Uint8Array, participant?: RemoteParticipant, _k?: unkno
     } else if (!state.admitted) {
       return; // ignore until admitted
     } else if (m.t === 'schedule') {
-      applySchedule(m.s as Schedule); // instant push of a schedule change
+      onSchedule(m.s as Schedule); // instant push of an action → execute it once, together
     }
   }
 }
@@ -559,6 +630,15 @@ function wireCommonAudio() {
   a.addEventListener('error', () => {
     $('#playerArtist').textContent = `⚠ Couldn't play this track`;
   });
+  // Recover from a buffer interruption: when it resumes after stalling, re-sync to live ONCE.
+  let stalled = false;
+  a.addEventListener('waiting', () => (stalled = true));
+  a.addEventListener('playing', () => {
+    if (stalled) {
+      stalled = false;
+      void resync();
+    }
+  });
 }
 
 function reflectPlayback(playing: boolean) {
@@ -635,12 +715,11 @@ async function setupHost() {
   // Adopt an in-progress party if one exists (host took over / rejoined); else cue track 1.
   const got = await api.getSchedule(state.party!.id).catch(() => null);
   if (got && got.schedule.trackKey && !got.schedule.ended) {
-    applySchedule(got.schedule);
+    onSchedule(got.schedule);
   } else if (state.playlist.length) {
     setSchedule({ trackKey: state.playlist[0].key, anchorPos: 0, playing: false });
   }
 
-  state.timers.push(window.setInterval(follow, FOLLOW_MS));
   updateTransportEnabled();
 }
 
@@ -655,8 +734,18 @@ function currentPlaying(): boolean {
 // The schedule = the single source of truth. Position is DERIVED, never pushed.
 // ---------------------------------------------------------------------------
 
-// HOST only: change the schedule. Persisted to the server + pushed for immediacy.
-function setSchedule(p: { trackKey?: string | null; anchorPos?: number; playing?: boolean; ended?: boolean }) {
+// ---------------------------------------------------------------------------
+// EVENT-DRIVEN sync. There is NO continuous correction loop. Each action becomes a
+// schedule whose anchorServerTime is a moment in the NEAR FUTURE; every device — host
+// included — schedules a SINGLE apply at that absolute instant, so they all fire together.
+// Between actions, devices just play untouched (same file, same speed → stay in sync).
+// ---------------------------------------------------------------------------
+
+// HOST only: issue an action. Builds a schedule that executes `lead` ms from now.
+function setSchedule(
+  p: { trackKey?: string | null; anchorPos?: number; playing?: boolean; ended?: boolean },
+  lead = SAME_LEAD
+) {
   const base: Schedule = state.schedule ?? {
     trackKey: null,
     anchorPos: 0,
@@ -668,111 +757,60 @@ function setSchedule(p: { trackKey?: string | null; anchorPos?: number; playing?
   const s: Schedule = {
     trackKey: p.trackKey !== undefined ? p.trackKey : base.trackKey,
     anchorPos: p.anchorPos !== undefined ? Math.max(0, Math.round(p.anchorPos)) : base.anchorPos, // whole seconds
-    anchorServerTime: serverNow(),
+    anchorServerTime: serverNow() + lead, // execute together, slightly in the future
     playing: p.playing !== undefined ? p.playing : base.playing,
     ended: p.ended !== undefined ? p.ended : base.ended,
     rev: base.rev + 1
   };
   state.schedule = s;
-  applySchedule(s); // host follows its own schedule
-  send({ t: 'schedule', s }); // instant push to listeners
-  void api.putSchedule(state.party!.id, s, state.hostPassword).catch(() => {}); // persist
+  send({ t: 'schedule', s }); // distribute to everyone
+  void api.putSchedule(state.party!.id, s, state.hostPassword).catch(() => {}); // persist for recovery/late-join
+  onSchedule(s, true); // the host obeys the same schedule (no direct action)
 }
 
-// BOTH: adopt a schedule (newer rev wins) and load its track.
-function applySchedule(s: Schedule) {
-  if (state.schedule && s.rev < state.schedule.rev) return; // ignore stale
+// BOTH: adopt a schedule and schedule ONE apply at its execution time.
+function onSchedule(s: Schedule, fromSelf = false) {
+  if (state.schedule && !fromSelf && s.rev < state.schedule.rev) return; // ignore stale
   state.schedule = s;
-  if (s.ended) {
-    endedByHost();
-    return;
-  }
-  if (s.trackKey && state.loadedKey !== s.trackKey) prepareTrack(s.trackKey);
-  follow();
-}
-
-// Where the timeline says we should be, right now (derived from server clock).
-function targetPos(s: Schedule): number {
-  return s.playing ? s.anchorPos + (serverNow() - s.anchorServerTime) / 1000 : s.anchorPos;
-}
-
-// BOTH: the self-correction loop. Runs ~1/s; also called on any schedule change / resume.
-//
-// Design goals (to feel immersive, not jittery):
-//   • DEAD-BAND: if we're within ~150ms, do NOTHING — devices just play, identical.
-//   • HYSTERESIS: once we start nudging, keep nudging until we're back under ~60ms, so the
-//     rate can't flip-flop around a threshold (that flip-flop WAS the audible wobble).
-//   • Don't fight the OS: while backgrounded we skip correction entirely and re-sync on return.
-//   • Don't start before ready: wait for buffering + a confident clock, so mid-join is clean.
-const DEADBAND = 0.15; // s — within this, leave playback alone
-const RESOLVED = 0.06; // s — stop nudging once back inside this
-const HARD_SEEK = 1.5; // s — only a big gap warrants an audible seek
-
-function follow() {
-  const s = state.schedule;
-  const a = state.audioEl;
-  if (!s || !a) return;
   if (s.ended) return endedByHost();
-  if (document.hidden) return; // OS is throttling us — don't issue bad seeks; resync on return
-  if (!state.serverSynced || !state.unlocked) return;
+  if (s.trackKey) prepareTrack(s.trackKey); // start buffering now
+  if (state.applyTimer) clearTimeout(state.applyTimer);
+  if (!state.unlocked) return; // will apply after the unlock gesture (resync)
 
+  const delay = s.anchorServerTime - serverNow();
+  if (delay > 30) state.applyTimer = window.setTimeout(() => applyOnce(s), delay);
+  else applyOnce(s); // already due (late join / recovery) → seek to live now
+}
+
+// BOTH: execute a schedule exactly once. No loops, no nudging.
+function applyOnce(s: Schedule) {
+  const a = state.audioEl;
+  if (!a || !state.schedule || s.rev < state.schedule.rev) return;
   if (!s.trackKey) {
     if (!a.paused) a.pause();
     setStatus(false);
     return;
   }
-  if (state.loadedKey !== s.trackKey) {
-    prepareTrack(s.trackKey);
-    return; // align next tick once it's loaded
-  }
-  if (!state.isHost && state.listenerPaused) return; // listener chose to pause locally
+  if (!state.isHost && state.listenerPaused) return; // listener chose to stay paused
+  if (state.loadedKey !== s.trackKey) prepareTrack(s.trackKey);
 
-  if (!s.playing) {
-    a.playbackRate = 1;
-    state.correcting = false;
-    if (Math.abs(a.currentTime - s.anchorPos) > 0.3) a.currentTime = Math.max(0, s.anchorPos);
-    if (!a.paused) a.pause();
-    setStatus(false);
-    return;
-  }
+  const elapsed = Math.max(0, (serverNow() - s.anchorServerTime) / 1000);
+  const target = s.playing ? s.anchorPos + elapsed : s.anchorPos;
+  const go = () => {
+    if (Math.abs(a.currentTime - target) > 0.15) a.currentTime = Math.max(0, target);
+    if (s.playing) a.play().catch(() => {});
+    else a.pause();
+    setStatus(s.playing);
+  };
+  if (a.readyState >= 1) go();
+  else a.addEventListener('loadedmetadata', go, { once: true });
+}
 
-  const tgt = targetPos(s);
-
-  // Start playback only once we have enough buffered — prevents the mid-join stall/struggle.
-  if (a.paused) {
-    if (a.readyState < 3) {
-      setStatus(true, true); // "Buffering…"
-      return;
-    }
-    a.currentTime = Math.max(0, tgt);
-    a.play().catch(() => {});
-  }
-
-  // Don't correct while buffering or before the clock is trustworthy (avoids mid-join jitter).
-  if (a.readyState < 2 || !state.clock.confident) {
-    a.playbackRate = 1;
-    setStatus(true);
-    return;
-  }
-
-  const drift = a.currentTime - tgt; // +ve = ahead of the timeline
-  const ad = Math.abs(drift);
-  if (ad > HARD_SEEK) {
-    a.currentTime = Math.max(0, tgt); // big gap → one corrective seek
-    a.playbackRate = 1;
-    state.correcting = false;
-    state.driftStrikes = 0;
-  } else {
-    // DEBOUNCE: only act on drift that persists across checks, so a single noisy clock
-    // reading (common on mobile Wi-Fi) never triggers a correction. This is what keeps
-    // an already-synced device perfectly still.
-    if (ad > DEADBAND) state.driftStrikes++;
-    else state.driftStrikes = 0;
-    if (state.driftStrikes >= 2) state.correcting = true;
-    if (ad < RESOLVED) state.correcting = false;
-    a.playbackRate = state.correcting ? (drift > 0 ? 0.985 : 1.015) : 1; // ~1.5%, inaudible
-  }
-  setStatus(true);
+// Live timeline position (derived from the server clock) — used by the host to anchor actions.
+function timelinePos(): number {
+  const s = state.schedule;
+  if (!s || !s.trackKey) return 0;
+  return s.playing ? s.anchorPos + (serverNow() - s.anchorServerTime) / 1000 : s.anchorPos;
 }
 
 function setStatus(playing: boolean, buffering = false) {
@@ -798,28 +836,28 @@ function prepareTrack(key: string) {
   renderPlaylist();
 }
 
-// ---- Host transport: every control just updates the schedule ----
+// ---- Host transport: every control just issues a scheduled action ----
 function hostPlay() {
   if (!currentKey() && state.playlist.length) prepareTrack(state.playlist[0].key);
-  const pos = state.schedule ? targetPos(state.schedule) : state.audioEl!.currentTime;
-  setSchedule({ trackKey: currentKey(), anchorPos: pos, playing: true });
+  setSchedule({ trackKey: currentKey(), anchorPos: timelinePos(), playing: true });
 }
 function hostPause() {
-  const pos = state.schedule && state.schedule.playing ? targetPos(state.schedule) : state.audioEl!.currentTime;
-  setSchedule({ anchorPos: pos, playing: false });
+  // Project to the execution instant so everyone (incl. host) pauses at the same second.
+  setSchedule({ anchorPos: timelinePos() + SAME_LEAD / 1000, playing: false });
 }
 function hostSeekTo(pos: number) {
   setSchedule({ anchorPos: pos, playing: currentPlaying() });
 }
 function hostSeekBy(s: number) {
   const a = state.audioEl!;
-  const from = state.schedule ? targetPos(state.schedule) : a.currentTime;
+  const from = timelinePos();
   const dur = isFinite(a.duration) ? a.duration : from + s;
   hostSeekTo(Math.max(0, Math.min(dur, from + s)));
 }
 function hostLoad(index: number, play: boolean) {
   if (index < 0 || index >= state.playlist.length) return;
-  setSchedule({ trackKey: state.playlist[index].key, anchorPos: 0, playing: play });
+  // Track change needs extra lead so every device can buffer the new file first.
+  setSchedule({ trackKey: state.playlist[index].key, anchorPos: 0, playing: play }, TRACK_LEAD);
 }
 function hostNext() {
   if (state.currentIndex < state.playlist.length - 1) hostLoad(state.currentIndex + 1, true);
@@ -849,6 +887,7 @@ async function pingServerTime() {
     const { now } = await api.time();
     state.clock.sample(t0, now, Date.now());
     state.serverSynced = true;
+    state.lastClockSync = Date.now();
     $('#syncDot').hidden = true;
   } catch {
     /* keep last estimate */
@@ -857,23 +896,33 @@ async function pingServerTime() {
 function startServerClock() {
   let n = 0;
   void pingServerTime();
-  // Fast initial burst so the clock is confident within ~1s → clean mid-join, no lurch.
+  // Fast initial burst so the clock is confident within ~1s → clean join, accurate actions.
   const fast = window.setInterval(async () => {
     await pingServerTime();
     if (++n >= 8) clearInterval(fast);
   }, 300);
   state.timers.push(fast);
-  state.timers.push(window.setInterval(pingServerTime, 15000)); // track clock drift
+  // Occasional refresh only (NOT a correction loop) — tracks slow clock drift. This never
+  // touches the audio, so it can't cause jitter.
+  state.timers.push(window.setInterval(pingServerTime, CLOCK_REFRESH_MS));
+}
+async function ensureFreshClock() {
+  if (Date.now() - state.lastClockSync > 8000) await pingServerTime();
 }
 
-// Re-sync after returning from background, on resume, etc.
+// Recovery path: on join, on returning from background, and after a stall. Refreshes the
+// clock + (for listeners) re-reads the schedule, then applies ONCE — no ongoing loop.
 async function resync() {
-  await pingServerTime();
+  if (state.ended) return;
+  await ensureFreshClock();
   if (!state.isHost && state.admitted) {
     const got = await api.getSchedule(state.party!.id).catch(() => null);
-    if (got) applySchedule(got.schedule);
+    if (got) {
+      onSchedule(got.schedule);
+      return;
+    }
   }
-  follow();
+  if (state.schedule) applyOnce(state.schedule);
 }
 
 const MAX_SONGS_PER_PARTY = 100;
@@ -927,23 +976,15 @@ function setupListener() {
     const a = state.audioEl!;
     if (a.paused) {
       state.listenerPaused = false;
-      state.unlocked = true;
-      void resync(); // re-read schedule + server clock, then follow
+      void resync(); // re-read schedule + clock, then apply once → back in sync
     } else {
       state.listenerPaused = true; // stays paused until they tap play
       a.pause();
     }
   });
 
-  // First gesture: unlock audio, then sync to the timeline.
-  $('#unmuteOverlay').hidden = false;
-  $<HTMLButtonElement>('#unmuteBtn').addEventListener('click', () => {
-    state.unlocked = true;
-    state.listenerPaused = false;
-    $('#unmuteOverlay').hidden = true;
-    void resync();
-  });
-
+  // No "tap to sync" popup — audio was already unlocked on the join gesture, so admitListener
+  // applies the timeline automatically.
   $('#syncDot').hidden = false;
 }
 
@@ -1053,7 +1094,6 @@ function endedByHost() {
 
   $('#player').hidden = true;
   $('#inviteOverlay').hidden = true;
-  $('#unmuteOverlay').hidden = true;
   $('#waitTitle').textContent = 'Party ended';
   $('#waitMsg').textContent = 'The host ended the party.';
   $('#waitSpinner').hidden = true;

@@ -1,33 +1,42 @@
 // visualizer.ts
 // -----------------------------------------------------------------------------
-// Platform-agnostic visualizer — NO Web Audio.
+// Reactive spectrum visualizer with a graceful fallback.
 //
-// Earlier this used an AnalyserNode, which forced audio through an AudioContext. That
-// breaks background playback on iOS and makes mobile audio jittery. So instead we draw a
-// lively equalizer from layered sine waves on a <canvas>: it animates while playing and
-// eases to calm when paused. Not literally frequency-reactive, but smooth and identical on
-// iPhone, Android and desktop — and it never touches the audio path.
+//   • If an AnalyserNode is connected (desktop + Android) → REAL frequency bars.
+//   • If not (iOS, where Web Audio would break background audio) → a smooth
+//     sine-driven equalizer so there's always something alive.
+//
+// Either way it fades in on play and eases to calm on pause.
 // -----------------------------------------------------------------------------
 
 export class Visualizer {
   private c2d: CanvasRenderingContext2D;
   private raf = 0;
   private t = 0;
-  private intensity = 0; // eases toward `target`
+  private intensity = 0; // eases toward target
   private target = 0; // 1 = playing, 0 = paused
-  private readonly BARS = 48;
+  private readonly BARS = 56;
+  private analyser: AnalyserNode | null = null;
+  private freq = new Uint8Array(0);
 
   constructor(private canvas: HTMLCanvasElement) {
     this.c2d = canvas.getContext('2d', { alpha: true })!;
+  }
+
+  /** Wire a real analyser for frequency-reactive bars. */
+  connect(analyser: AnalyserNode) {
+    analyser.fftSize = 128;
+    analyser.smoothingTimeConstant = 0.82;
+    this.analyser = analyser;
+    this.freq = new Uint8Array(analyser.frequencyBinCount);
   }
 
   start() {
     this.target = 1;
     if (!this.raf) this.raf = requestAnimationFrame(this.draw);
   }
-
   stop() {
-    this.target = 0; // ease down to calm, the loop self-stops when fully settled
+    this.target = 0;
     if (!this.raf) this.raf = requestAnimationFrame(this.draw);
   }
 
@@ -50,7 +59,7 @@ export class Visualizer {
     const mid = h / 2;
     ctx.clearRect(0, 0, w, h);
 
-    this.intensity += (this.target - this.intensity) * 0.08; // smooth ease
+    this.intensity += (this.target - this.intensity) * 0.08;
     this.t += 0.045;
 
     const grad = ctx.createLinearGradient(0, 0, w, 0);
@@ -59,14 +68,22 @@ export class Visualizer {
     grad.addColorStop(1, '#a78bfa');
     ctx.fillStyle = grad;
 
+    if (this.analyser) this.analyser.getByteFrequencyData(this.freq);
+    const usable = this.analyser ? Math.floor(this.freq.length * 0.85) : 0;
+
     const gap = 3;
     const bw = (w - (this.BARS - 1) * gap) / this.BARS;
     for (let i = 0; i < this.BARS; i++) {
-      // Layered sines give an organic, non-repeating equalizer motion.
-      const n =
-        (Math.sin(this.t + i * 0.5) * 0.5 + 0.5) *
-        (Math.sin(this.t * 0.7 + i * 0.23) * 0.4 + 0.6);
-      const bh = Math.max(bw, n * h * 0.9 * this.intensity);
+      let level: number;
+      if (this.analyser) {
+        // REAL spectrum: low freqs (bass) on the left → highs on the right.
+        level = (this.freq[Math.floor((i / this.BARS) * usable)] / 255) ** 1.25;
+      } else {
+        // Fallback: layered sines for organic motion.
+        level =
+          (Math.sin(this.t + i * 0.5) * 0.5 + 0.5) * (Math.sin(this.t * 0.7 + i * 0.23) * 0.4 + 0.6);
+      }
+      const bh = Math.max(bw, level * h * 0.92 * this.intensity);
       roundRect(ctx, i * (bw + gap), mid - bh / 2, bw, bh, bw / 2);
       ctx.fill();
     }
