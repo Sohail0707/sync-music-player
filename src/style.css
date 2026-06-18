@@ -129,7 +129,8 @@ input::placeholder { color: var(--muted); }
 .seg button.on { color: #fff; background: var(--grad-brand); box-shadow: var(--glow-purple); }
 
 /* ---------------- Player screen ---------------- */
-.player { gap: 14px; }
+/* Fixed to the viewport so the bottom bar stays put and only the track list scrolls. */
+.player { gap: 14px; height: 100dvh; max-height: 100dvh; overflow: hidden; }
 
 .app-bar { display: flex; align-items: center; justify-content: space-between; }
 .ab-left, .ab-right { display: flex; align-items: center; gap: 10px; }
@@ -267,8 +268,9 @@ input::placeholder { color: var(--muted); }
 .pl-eq i:nth-child(2) { animation-delay: 0.2s; }
 .pl-eq i:nth-child(3) { animation-delay: 0.4s; }
 
-/* bottom function bar */
+/* bottom function bar — pinned at the bottom of the player screen */
 .bottom-bar {
+  flex: none;
   display: flex; gap: 8px;
   margin-top: 12px; padding: 10px;
   background: var(--surface); border: 1px solid rgba(255, 255, 255, 0.05);

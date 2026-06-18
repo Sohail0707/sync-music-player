@@ -56,6 +56,7 @@ interface AppState {
   unlocked: boolean; // listener has tapped to allow audio
   listenerPaused: boolean; // listener manually paused — don't auto-resume
   admitted: boolean; // listener has been let in by the host
+  ended: boolean; // party ended by host
   timers: number[];
 }
 
@@ -79,6 +80,7 @@ const state: AppState = {
   unlocked: false,
   listenerPaused: false,
   admitted: false,
+  ended: false,
   timers: []
 };
 
@@ -362,6 +364,17 @@ async function connect(url: string, token: string) {
       findHost();
       if (!state.admitted) send({ t: 'join-request', name: state.myName });
     });
+    // Fallback: if the host's connection drops without an explicit "ended" message,
+    // treat it as the party ending.
+    room.on(RoomEvent.ParticipantDisconnected, (p) => {
+      let wasHost = p.identity === state.hostId;
+      try {
+        wasHost = wasHost || JSON.parse(p.metadata || '{}').role === 'host';
+      } catch {
+        /* ignore */
+      }
+      if (wasHost) endedByHost();
+    });
   }
 
   await room.connect(url, token);
@@ -442,7 +455,8 @@ function onData(payload: Uint8Array, participant?: RemoteParticipant, _k?: unkno
       send(currentState(), [participant.identity]);
     }
   } else {
-    if (m.t === 'admit') void admitListener(participant.identity);
+    if (m.t === 'ended') endedByHost();
+    else if (m.t === 'admit') void admitListener(participant.identity);
     else if (m.t === 'reject') {
       $('#waitTitle').textContent = 'Host declined';
       $('#waitMsg').textContent = "The host didn't let you in this time.";
@@ -607,6 +621,8 @@ function setMeta(track?: Track) {
 // -----------------------------------------------------------------------------
 function setupHost() {
   $('#addMusicBtn').hidden = false;
+  // Host doesn't "leave" — they "End" the party (which kicks everyone).
+  $('#leaveBtn').querySelector('small')!.textContent = 'End';
   $('#playerArtist').textContent = `${state.party!.name} · You are hosting`;
 
   const fileInput = $<HTMLInputElement>('#fileInput');
@@ -937,6 +953,11 @@ async function copyInviteLink() {
 // Leave + utils
 // -----------------------------------------------------------------------------
 async function leave() {
+  // Host "ends" the party — tell everyone before disconnecting so they auto-leave.
+  if (state.isHost && state.room) {
+    send({ t: 'ended' });
+    await new Promise((r) => setTimeout(r, 250)); // let the reliable message flush
+  }
   state.timers.forEach((t) => clearInterval(t));
   try {
     await state.room?.disconnect();
@@ -948,6 +969,25 @@ async function leave() {
     }
     location.reload();
   }
+}
+
+// Listener: the host ended the party (explicit message OR host disconnected).
+function endedByHost() {
+  if (state.isHost || state.ended) return;
+  state.ended = true;
+  state.timers.forEach((t) => clearInterval(t));
+  state.audioEl?.pause();
+  state.room?.disconnect().catch(() => {});
+
+  $('#player').hidden = true;
+  $('#inviteOverlay').hidden = true;
+  $('#unmuteOverlay').hidden = true;
+  $('#waitTitle').textContent = 'Party ended';
+  $('#waitMsg').textContent = 'The host ended the party.';
+  $('#waitSpinner').hidden = true;
+  $<HTMLButtonElement>('#cancelWaitBtn').textContent = 'Back to start';
+  $('#waitingOverlay').hidden = false;
+  setTimeout(() => location.reload(), 2500);
 }
 
 function fmt(sec: number) {
