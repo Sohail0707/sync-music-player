@@ -63,6 +63,7 @@ interface AppState {
   admitted: boolean; // listener has been let in by the host
   ended: boolean; // party ended
   loadedKey: string | null; // track key currently loaded into the audio element
+  correcting: boolean; // currently nudging playbackRate (hysteresis flag)
   timers: number[];
 }
 
@@ -89,6 +90,7 @@ const state: AppState = {
   admitted: false,
   ended: false,
   loadedKey: null,
+  correcting: false,
   timers: []
 };
 
@@ -383,6 +385,9 @@ async function connect(url: string, token: string) {
   const audioEl = new Audio();
   audioEl.crossOrigin = 'anonymous'; // needed for R2 CORS + Web Audio analyser
   audioEl.preload = 'auto';
+  // Keep pitch stable during the tiny rate nudges we use for correction.
+  (audioEl as any).preservesPitch = true;
+  (audioEl as any).webkitPreservesPitch = true;
   state.audioEl = audioEl;
 
   // Common header.
@@ -722,12 +727,25 @@ function targetPos(s: Schedule): number {
 }
 
 // BOTH: the self-correction loop. Runs ~1/s; also called on any schedule change / resume.
+//
+// Design goals (to feel immersive, not jittery):
+//   • DEAD-BAND: if we're within ~150ms, do NOTHING — devices just play, identical.
+//   • HYSTERESIS: once we start nudging, keep nudging until we're back under ~60ms, so the
+//     rate can't flip-flop around a threshold (that flip-flop WAS the audible wobble).
+//   • Don't fight the OS: while backgrounded we skip correction entirely and re-sync on return.
+//   • Don't start before ready: wait for buffering + a confident clock, so mid-join is clean.
+const DEADBAND = 0.15; // s — within this, leave playback alone
+const RESOLVED = 0.06; // s — stop nudging once back inside this
+const HARD_SEEK = 1.5; // s — only a big gap warrants an audible seek
+
 function follow() {
   const s = state.schedule;
   const a = state.audioEl;
   if (!s || !a) return;
   if (s.ended) return endedByHost();
-  if (!state.serverSynced || !state.unlocked) return; // need clock + audio gesture
+  if (document.hidden) return; // OS is throttling us — don't issue bad seeks; resync on return
+  if (!state.serverSynced || !state.unlocked) return;
+
   if (!s.trackKey) {
     if (!a.paused) a.pause();
     setStatus(false);
@@ -735,13 +753,13 @@ function follow() {
   }
   if (state.loadedKey !== s.trackKey) {
     prepareTrack(s.trackKey);
-    return; // align on the next tick once it's loaded
+    return; // align next tick once it's loaded
   }
   if (!state.isHost && state.listenerPaused) return; // listener chose to pause locally
-  if (a.readyState < 1) return;
 
   if (!s.playing) {
     a.playbackRate = 1;
+    state.correcting = false;
     if (Math.abs(a.currentTime - s.anchorPos) > 0.3) a.currentTime = Math.max(0, s.anchorPos);
     if (!a.paused) a.pause();
     setStatus(false);
@@ -749,25 +767,41 @@ function follow() {
   }
 
   const tgt = targetPos(s);
+
+  // Start playback only once we have enough buffered — prevents the mid-join stall/struggle.
   if (a.paused) {
+    if (a.readyState < 3) {
+      setStatus(true, true); // "Buffering…"
+      return;
+    }
     a.currentTime = Math.max(0, tgt);
     a.play().catch(() => {});
   }
+
+  // Don't correct while buffering or before the clock is trustworthy (avoids mid-join jitter).
+  if (a.readyState < 2 || !state.clock.confident) {
+    a.playbackRate = 1;
+    setStatus(true);
+    return;
+  }
+
   const drift = a.currentTime - tgt; // +ve = ahead of the timeline
-  if (Math.abs(drift) > 1.0) {
-    a.currentTime = Math.max(0, tgt); // big gap → hard seek
+  const ad = Math.abs(drift);
+  if (ad > HARD_SEEK) {
+    a.currentTime = Math.max(0, tgt); // big gap → one corrective seek
     a.playbackRate = 1;
-  } else if (Math.abs(drift) > 0.05) {
-    a.playbackRate = drift > 0 ? 0.98 : 1.02; // small drift → inaudible nudge
+    state.correcting = false;
   } else {
-    a.playbackRate = 1;
+    if (ad > DEADBAND) state.correcting = true; // engage gentle correction
+    else if (ad < RESOLVED) state.correcting = false; // close enough — disengage
+    a.playbackRate = state.correcting ? (drift > 0 ? 0.985 : 1.015) : 1; // ~1.5%, inaudible
   }
   setStatus(true);
 }
 
-function setStatus(playing: boolean) {
+function setStatus(playing: boolean, buffering = false) {
   if (state.isHost) return; // host shows the "hosting" line
-  $('#playerArtist').textContent = playing ? '🔴 In sync — live' : '⏸ Host paused';
+  $('#playerArtist').textContent = buffering ? '⏳ Buffering…' : playing ? '🔴 In sync — live' : '⏸ Host paused';
 }
 
 // Load a track into the audio element (idempotent per key).

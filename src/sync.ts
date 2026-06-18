@@ -32,11 +32,19 @@ export class SyncClock {
     // Lowest-RTT recent sample = least network-jittered = most trustworthy.
     let best = this.samples[0];
     for (const s of this.samples) if (s.rtt < best.rtt) best = s;
-    this.offset = best.offset;
+
+    // Smooth the applied offset (EWMA) so a new "best" sample nudges the timeline
+    // gradually instead of yanking it — this kills target jitter that caused wobble.
+    this.offset = this.synced ? this.offset + (best.offset - this.offset) * 0.4 : best.offset;
     this.synced = true;
   }
 
-  /** Best estimate of the host's clock right now. */
+  /** Enough low-jitter samples to trust the estimate (don't correct before this). */
+  get confident() {
+    return this.samples.length >= 3;
+  }
+
+  /** Best estimate of the server clock right now. */
   hostNow() {
     return Date.now() + this.offset;
   }
