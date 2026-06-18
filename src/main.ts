@@ -16,7 +16,7 @@ import { Room, RoomEvent, type RemoteParticipant } from 'livekit-client';
 import QRCode from 'qrcode';
 
 import { api, type Party, type Track } from './api';
-import { SyncClock, type SyncState } from './sync';
+import { SyncClock } from './sync';
 import { icons } from './icons';
 import { Visualizer } from './visualizer';
 import './style.css';
@@ -52,7 +52,6 @@ interface AppState {
   seeking: boolean;
   clock: SyncClock;
   hostId: string | null; // listener's view of the host participant
-  lastState: SyncState | null; // last transport state the listener received
   unlocked: boolean; // listener has tapped to allow audio
   listenerPaused: boolean; // listener manually paused — don't auto-resume
   admitted: boolean; // listener has been let in by the host
@@ -91,7 +90,6 @@ const state: AppState = {
   seeking: false,
   clock: new SyncClock(),
   hostId: null,
-  lastState: null,
   unlocked: false,
   listenerPaused: false,
   admitted: false,
@@ -470,7 +468,9 @@ function onData(payload: Uint8Array, participant?: RemoteParticipant, _k?: unkno
     } else if (m.t === 'clock-ping') {
       send({ t: 'clock-pong', id: m.id, c0: m.c0, h: Date.now() }, [participant.identity]);
     } else if (m.t === 'hello') {
-      send(currentState(), [participant.identity]);
+      // A device (re)joined and asked for the current point — re-sync EVERYONE to a
+      // shared whole-second boundary so the new device lands exactly in place.
+      broadcastSync();
     }
   } else {
     if (m.t === 'ended') endedByHost();
@@ -483,17 +483,17 @@ function onData(payload: Uint8Array, participant?: RemoteParticipant, _k?: unkno
     } else if (!state.admitted) {
       return; // ignore everything else until admitted
     } else if (m.t === 'cmd') {
-      // Scheduled transition — run it at the same instant as everyone else.
+      // Absolute scheduled transition — run it at the same instant as everyone else.
       if (state.unlocked) applyScheduled(m as Cmd);
       else state.lastCmd = m as Cmd;
-    } else if (m.t === 'state') {
-      // Heartbeat — anchors drift correction; only hard-resyncs if we're on the wrong track.
-      state.lastState = m as SyncState;
-      if (state.unlocked && !state.listenerPaused && state.loadedKey !== (m as SyncState).key) applyState(m as SyncState);
     } else if (m.t === 'clock-pong') {
       state.clock.sample(m.c0, m.h, Date.now());
       $('#syncDot').hidden = true;
-    } else if (m.t === 'playlist') void refreshPlaylist().then(() => state.lastState && applyState(state.lastState));
+    } else if (m.t === 'playlist') {
+      void refreshPlaylist().then(() => {
+        if (state.lastCmd) applyScheduled(state.lastCmd);
+      });
+    }
   }
 }
 
@@ -530,7 +530,8 @@ function respondJoin(identity: string, allow: boolean) {
   const name = pendingJoins.get(identity) || 'Guest';
   pendingJoins.delete(identity);
   send({ t: allow ? 'admit' : 'reject' }, [identity]);
-  if (allow) send(currentState(), [identity]); // give them the current state immediately
+  // Re-sync the whole room to a shared whole-second boundary so the new device fits in.
+  if (allow) setTimeout(() => broadcastSync(), 400);
   toast(allow ? `✅ Let ${name} in` : `🚫 Rejected ${name}`);
   renderAdmitQueue();
 }
@@ -675,12 +676,10 @@ function setupHost() {
     if (isFinite(a.duration)) scheduleCommand(currentKey(), (Number(seek.value) / 1000) * a.duration, !a.paused);
   });
 
-  // Heartbeat: keep clocks/late-joiners aligned + anchor drift correction.
-  const a = state.audioEl!;
-  a.addEventListener('play', broadcast);
-  a.addEventListener('pause', broadcast);
-  a.addEventListener('ended', () => hostNext());
-  state.timers.push(window.setInterval(broadcast, 3000));
+  // Periodic absolute re-sync: every few seconds, snap everyone (host included) to the
+  // next whole-second boundary. Keeps all devices locked without per-device fudging.
+  state.audioEl!.addEventListener('ended', () => hostNext());
+  state.timers.push(window.setInterval(() => broadcastSync(), 4000));
 
   // Cue the first track (loaded, paused) so the host can just press play.
   if (!currentKey() && state.playlist.length) prepareTrack(state.playlist[0].key);
@@ -690,29 +689,51 @@ function setupHost() {
 function currentKey(): string | null {
   return state.loadedKey ?? state.playlist[state.currentIndex]?.key ?? null;
 }
-function currentState(): SyncState {
-  const a = state.audioEl!;
-  return { t: 'state', key: currentKey(), pos: a.currentTime || 0, playing: !a.paused, h: Date.now() };
-}
-function broadcast() {
-  if (state.isHost) send(currentState());
-}
 
 // ---------------------------------------------------------------------------
-// Scheduled-command engine (shared by host + listeners)
+// Absolute scheduled-command engine (shared by host + listeners)
 //
-// The host NEVER acts immediately. It schedules a transition for `at` (a moment
-// in the near future, in host-clock time) and broadcasts it. Every device —
-// including the host — runs it at `at`, converted to its own clock via the
-// estimated offset. So nobody starts before anyone else.
+// The host NEVER acts immediately. It schedules a transition for an ABSOLUTE host-
+// clock instant `at`, with a WHOLE-SECOND position `pos`. Every device — including
+// the host — converts `at` to its own clock and runs it then. So all devices land on
+// the exact same second at the exact same moment; nobody starts early.
 // ---------------------------------------------------------------------------
 
-// HOST: schedule + broadcast a transition.
+// Send a command to everyone AND schedule it locally — host obeys its own schedule.
+function emitCmd(cmd: Cmd) {
+  send(cmd);
+  applyScheduled(cmd);
+}
+
+// HOST: a discrete action (play / pause / seek / track). Position snaps to a whole second.
 function scheduleCommand(key: string | null, pos: number, playing: boolean) {
   const newTrack = !!key && key !== state.loadedKey;
-  const cmd: Cmd = { t: 'cmd', key, pos, playing, at: Date.now() + (newTrack ? NEW_TRACK_LEAD : SAME_TRACK_LEAD) };
-  send(cmd); // tell everyone
-  applyScheduled(cmd); // …and obey the same schedule ourselves
+  emitCmd({
+    t: 'cmd',
+    key,
+    pos: Math.max(0, Math.round(pos)), // absolute whole seconds, never fractional
+    playing,
+    at: Date.now() + (newTrack ? NEW_TRACK_LEAD : SAME_TRACK_LEAD)
+  });
+}
+
+// HOST: periodic / on-join re-sync. Targets the next whole-second the host will reach,
+// timed so the host itself doesn't jump and every listener snaps to that exact second.
+function broadcastSync() {
+  if (!state.isHost) return;
+  const a = state.audioEl!;
+  const key = currentKey();
+  if (!key) {
+    emitCmd({ t: 'cmd', key: null, pos: 0, playing: false, at: Date.now() + 200 });
+    return;
+  }
+  if (a.paused) {
+    emitCmd({ t: 'cmd', key, pos: Math.max(0, Math.round(a.currentTime)), playing: false, at: Date.now() + SAME_TRACK_LEAD });
+    return;
+  }
+  const pos = Math.ceil(a.currentTime + 1); // next whole second, ≥1s ahead
+  const at = Date.now() + Math.round((pos - a.currentTime) * 1000); // exact moment host hits `pos`
+  emitCmd({ t: 'cmd', key, pos, playing: true, at });
 }
 
 // BOTH: buffer the track now, then run the action exactly at cmd.at.
@@ -753,7 +774,8 @@ function runCmd(cmd: Cmd) {
   if (state.loadedKey !== cmd.key) prepareTrack(cmd.key);
   const shouldPlay = cmd.playing && !(!state.isHost && state.listenerPaused);
   const go = () => {
-    if (Math.abs(a.currentTime - cmd.pos) > 0.25) a.currentTime = Math.max(0, cmd.pos);
+    // Seek only when meaningfully off, so periodic re-syncs are silent when already aligned.
+    if (Math.abs(a.currentTime - cmd.pos) > 0.15) a.currentTime = Math.max(0, cmd.pos);
     if (shouldPlay) a.play().catch(() => {});
     else a.pause();
     if (!state.isHost) $('#playerArtist').textContent = cmd.playing ? '🔴 In sync — live' : '⏸ Host paused';
@@ -836,7 +858,8 @@ async function uploadFiles(files: File[]) {
 // LISTENER
 // -----------------------------------------------------------------------------
 function setupListener() {
-  // Listener follows the host: hide host-only transport, keep a local play/pause.
+  // Listener gets a clean player: no playlist, no host transport — just play/pause.
+  $('#content').hidden = true;
   $('#progressRow').classList.add('readonly');
   $<HTMLInputElement>('#seekBar').disabled = true;
   for (const id of ['prevBtn', 'backBtn', 'fwdBtn', 'nextBtn']) $(`#${id}`).hidden = true;
@@ -847,29 +870,33 @@ function setupListener() {
     if (a.paused) {
       state.listenerPaused = false;
       state.unlocked = true;
-      if (state.lastState) applyState(state.lastState);
+      askResync();
     } else {
-      state.listenerPaused = true; // stays paused; heartbeat won't auto-resume
+      state.listenerPaused = true; // stays paused; re-sync won't auto-resume
       a.pause();
     }
   });
 
-  // First gesture: unlock audio, then apply whatever the host is doing.
+  // First gesture: unlock audio, then ask the host to re-sync everyone.
   $('#unmuteOverlay').hidden = false;
   $<HTMLButtonElement>('#unmuteBtn').addEventListener('click', () => {
     state.unlocked = true;
     state.listenerPaused = false;
     ensureGraph();
     $('#unmuteOverlay').hidden = true;
-    findHost();
-    send({ t: 'hello', name: state.myName }); // ask host for current state
-    if (state.lastState) applyState(state.lastState);
+    askResync();
   });
 
-  // Clock sync: a quick burst of pings, then occasional re-syncs. Plus drift correction.
   $('#syncDot').hidden = false;
   startClockSync();
-  state.timers.push(window.setInterval(driftCorrect, 1500));
+}
+
+// Ask the host for a fresh whole-second sync (host re-syncs everyone), and apply the
+// last known command immediately so there's no dead air while we wait.
+function askResync() {
+  findHost();
+  send({ t: 'hello', name: state.myName });
+  if (state.lastCmd) applyScheduled(state.lastCmd);
 }
 
 function findHost() {
@@ -901,69 +928,6 @@ function startClockSync() {
   state.timers.push(window.setInterval(ping, 12000));
 }
 
-function applyState(s: SyncState) {
-  state.lastState = s;
-  // Respect a manual local pause — don't let the host's heartbeat resume us.
-  if (!state.unlocked || state.listenerPaused) return;
-  const a = state.audioEl!;
-
-  if (!s.key) {
-    a.pause();
-    $('#playerArtist').textContent = 'Host hasn’t started yet…';
-    return;
-  }
-
-  const idx = state.playlist.findIndex((t) => t.key === s.key);
-  if (idx < 0) {
-    // We don't have this track yet — refetch and re-apply.
-    void refreshPlaylist().then(() => state.lastState && applyState(state.lastState));
-    return;
-  }
-
-  const target = s.pos + (s.playing ? (state.clock.hostNow() - s.h) / 1000 : 0);
-
-  const apply = () => {
-    if (Math.abs(a.currentTime - target) > 0.5) a.currentTime = Math.max(0, target);
-    if (s.playing) a.play().catch(() => {});
-    else a.pause();
-    $('#playerArtist').textContent = s.playing ? '🔴 In sync — live' : '⏸ Host paused';
-  };
-
-  if (idx !== state.currentIndex || state.loadedKey !== s.key || !a.src) {
-    state.currentIndex = idx;
-    a.src = state.playlist[idx].url;
-    state.loadedKey = s.key;
-    setMeta(state.playlist[idx]);
-    renderPlaylist();
-    a.addEventListener('loadedmetadata', apply, { once: true });
-    a.load();
-  } else if (a.readyState >= 1) {
-    apply();
-  } else {
-    a.addEventListener('loadedmetadata', apply, { once: true });
-  }
-}
-
-// Gently keep the listener locked to the host's timeline using tiny rate nudges,
-// hard-seeking only on a big drift (e.g. after a stall).
-function driftCorrect() {
-  const s = state.lastState;
-  const a = state.audioEl;
-  if (!s || !a || !state.unlocked || !s.playing || a.paused) return;
-  if (state.loadedKey !== s.key) return;
-
-  const target = s.pos + (state.clock.hostNow() - s.h) / 1000;
-  const drift = a.currentTime - target; // +ve = we're ahead
-  if (Math.abs(drift) > 1.0) {
-    a.currentTime = Math.max(0, target);
-    a.playbackRate = 1;
-  } else if (Math.abs(drift) > 0.08) {
-    a.playbackRate = drift > 0 ? 0.97 : 1.03; // inaudible nudge toward the host
-  } else {
-    a.playbackRate = 1;
-  }
-}
-
 // -----------------------------------------------------------------------------
 // Media Session (lock-screen controls + background)
 // -----------------------------------------------------------------------------
@@ -983,7 +947,7 @@ function setupMediaSession() {
         play: () => {
           state.listenerPaused = false;
           state.unlocked = true;
-          if (state.lastState) applyState(state.lastState);
+          askResync();
         },
         pause: () => {
           state.listenerPaused = true;

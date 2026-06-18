@@ -129,8 +129,8 @@ input::placeholder { color: var(--muted); }
 .seg button.on { color: #fff; background: var(--grad-brand); box-shadow: var(--glow-purple); }
 
 /* ---------------- Player screen ---------------- */
-/* Fixed to the viewport so the bottom bar stays put and only the track list scrolls. */
-.player { gap: 14px; height: 100dvh; max-height: 100dvh; overflow: hidden; }
+/* Natural page scroll; the bottom bar is sticky so it never scrolls away. */
+.player { gap: 14px; min-height: 100dvh; }
 
 .app-bar { display: flex; align-items: center; justify-content: space-between; }
 .ab-left, .ab-right { display: flex; align-items: center; gap: 10px; }
@@ -153,17 +153,22 @@ input::placeholder { color: var(--muted); }
 .status.reconnecting { background: var(--accent); }
 .status.disconnected { background: var(--danger); }
 
-/* Player card */
+/* Player card — never grows, so the track list below always gets space */
 .player-card {
+  flex: 0 0 auto;
+  min-height: 0;
   background: linear-gradient(180deg, var(--surface) 0%, var(--bg-elev) 100%);
   border: 1px solid rgba(255, 255, 255, 0.05);
   border-radius: var(--radius-lg);
-  padding: 18px 18px 22px;
-  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 16px 16px 18px;
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
 }
 
+/* Bounded square art: capped by both width and viewport height so the playlist
+   always has room (this was the bug — a full-height artwork collapsed the list). */
 .artwork {
-  position: relative; width: 100%; aspect-ratio: 1 / 1; max-height: 46vh;
+  position: relative; width: 100%; max-width: 320px; aspect-ratio: 1 / 1;
+  max-height: 34vh; margin: 0 auto; flex: 0 0 auto;
   border-radius: var(--radius-lg); overflow: hidden;
   background: var(--grad-art);
   display: grid; place-items: center;
@@ -235,15 +240,15 @@ input::placeholder { color: var(--muted); }
 }
 .ctrl.play svg { width: 30px; height: 30px; }
 
-/* track list */
-.content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* track list — flows naturally in the page */
+.content { display: flex; flex-direction: column; }
 .list-head {
   display: flex; align-items: baseline; justify-content: space-between;
   padding: 4px 6px 8px;
 }
 .list-head #listTitle { font-size: 1rem; font-weight: 600; }
 .list-count { font-size: 0.78rem; color: var(--muted); }
-.playlist { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1; }
+.playlist { list-style: none; padding: 0; margin: 0; }
 .playlist li {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 12px; border-radius: var(--radius); cursor: pointer; color: var(--text-dim);
@@ -268,13 +273,19 @@ input::placeholder { color: var(--muted); }
 .pl-eq i:nth-child(2) { animation-delay: 0.2s; }
 .pl-eq i:nth-child(3) { animation-delay: 0.4s; }
 
-/* bottom function bar — pinned at the bottom of the player screen */
+/* bottom function bar — sticky so it's always visible; margin-top:auto pins it to the
+   bottom when the page is short, and it stays put while the playlist scrolls. */
 .bottom-bar {
   flex: none;
+  position: sticky;
+  bottom: max(10px, env(safe-area-inset-bottom));
+  z-index: 5;
+  margin-top: auto;
   display: flex; gap: 8px;
-  margin-top: 12px; padding: 10px;
-  background: var(--surface); border: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 10px;
+  background: var(--surface-2); border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--radius-lg);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 .tab {
   flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px;
@@ -286,8 +297,8 @@ input::placeholder { color: var(--muted); }
 .tab.danger { color: var(--danger); }
 
 /* Listener-only tweaks: artwork gets more room, list hidden */
-body.is-listener .player-card { flex: 1; justify-content: center; }
-body.is-listener .artwork { max-height: 52vh; }
+/* Listener also sees the (read-only) playlist, so keep the same bounded layout. */
+body.is-listener .artwork { max-height: 40vh; max-width: 360px; }
 
 /* ---------------- Overlays ---------------- */
 .overlay {
