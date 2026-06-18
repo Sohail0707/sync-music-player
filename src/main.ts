@@ -30,13 +30,6 @@ const FOLLOW_MS = 1000; // how often each device self-corrects to the timeline
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-// iPadOS reports as MacIntel + touch. On iOS we must NOT route audio through Web Audio
-// (it would suspend in the background), so the real analyser visualizer is desktop/Android
-// only; iOS gets a CSS pulse instead — keeping background playback intact.
-const isIOS =
-  /iP(hone|ad|od)/.test(navigator.userAgent) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
 // -----------------------------------------------------------------------------
@@ -49,8 +42,6 @@ interface AppState {
   party: Party | null;
   hostPassword: string;
   audioEl: HTMLAudioElement | null;
-  audioCtx: AudioContext | null;
-  graphReady: boolean;
   playlist: Track[];
   currentIndex: number;
   seeking: boolean;
@@ -64,6 +55,7 @@ interface AppState {
   ended: boolean; // party ended
   loadedKey: string | null; // track key currently loaded into the audio element
   correcting: boolean; // currently nudging playbackRate (hysteresis flag)
+  driftStrikes: number; // consecutive over-deadband readings (debounce)
   timers: number[];
 }
 
@@ -76,8 +68,6 @@ const state: AppState = {
   party: null,
   hostPassword: '',
   audioEl: null,
-  audioCtx: null,
-  graphReady: false,
   playlist: [],
   currentIndex: -1,
   seeking: false,
@@ -91,6 +81,7 @@ const state: AppState = {
   ended: false,
   loadedKey: null,
   correcting: false,
+  driftStrikes: 0,
   timers: []
 };
 
@@ -233,9 +224,8 @@ $('#app').innerHTML = /* html */ `
 
 const viz = new Visualizer($<HTMLCanvasElement>('#vizCanvas'));
 
-// Resume the (visualizer) AudioContext + draw loop after returning from background.
+// Restart the visualizer draw loop after returning from background (rAF pauses while hidden).
 function resumeViz() {
-  state.audioCtx?.resume?.().catch(() => {});
   if (state.audioEl && !state.audioEl.paused) viz.start();
 }
 document.addEventListener('visibilitychange', () => {
@@ -383,7 +373,7 @@ async function connect(url: string, token: string) {
 
   // Shared audio element. Plain <audio> = background-friendly on every platform.
   const audioEl = new Audio();
-  audioEl.crossOrigin = 'anonymous'; // needed for R2 CORS + Web Audio analyser
+  audioEl.crossOrigin = 'anonymous'; // R2 CORS-friendly fetch
   audioEl.preload = 'auto';
   // Keep pitch stable during the tiny rate nudges we use for correction.
   (audioEl as any).preservesPitch = true;
@@ -579,25 +569,6 @@ function reflectPlayback(playing: boolean) {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
 }
 
-// Lazily build the analyser graph for the visualizer — DESKTOP/ANDROID ONLY.
-// On iOS we deliberately skip this so audio keeps playing in the background.
-function ensureGraph() {
-  state.audioCtx?.resume?.().catch(() => {});
-  if (isIOS || state.graphReady) return;
-  try {
-    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    state.audioCtx = ctx;
-    const src = ctx.createMediaElementSource(state.audioEl!);
-    const analyser = ctx.createAnalyser();
-    src.connect(analyser);
-    src.connect(ctx.destination); // keep it audible
-    viz.connect(analyser);
-    state.graphReady = true;
-  } catch (e) {
-    console.warn('Visualizer graph unavailable:', e);
-  }
-}
-
 function updateProgress() {
   const a = state.audioEl!;
   $('#totTime').textContent = fmt(a.duration);
@@ -639,7 +610,6 @@ async function setupHost() {
   fileInput.addEventListener('change', () => void uploadFiles(Array.from(fileInput.files ?? [])));
 
   $<HTMLButtonElement>('#playPauseBtn').addEventListener('click', () => {
-    ensureGraph(); // gesture path — set up Web Audio here
     if (currentPlaying()) hostPause();
     else hostPlay();
   });
@@ -791,9 +761,15 @@ function follow() {
     a.currentTime = Math.max(0, tgt); // big gap → one corrective seek
     a.playbackRate = 1;
     state.correcting = false;
+    state.driftStrikes = 0;
   } else {
-    if (ad > DEADBAND) state.correcting = true; // engage gentle correction
-    else if (ad < RESOLVED) state.correcting = false; // close enough — disengage
+    // DEBOUNCE: only act on drift that persists across checks, so a single noisy clock
+    // reading (common on mobile Wi-Fi) never triggers a correction. This is what keeps
+    // an already-synced device perfectly still.
+    if (ad > DEADBAND) state.driftStrikes++;
+    else state.driftStrikes = 0;
+    if (state.driftStrikes >= 2) state.correcting = true;
+    if (ad < RESOLVED) state.correcting = false;
     a.playbackRate = state.correcting ? (drift > 0 ? 0.985 : 1.015) : 1; // ~1.5%, inaudible
   }
   setStatus(true);
@@ -881,10 +857,11 @@ async function pingServerTime() {
 function startServerClock() {
   let n = 0;
   void pingServerTime();
+  // Fast initial burst so the clock is confident within ~1s → clean mid-join, no lurch.
   const fast = window.setInterval(async () => {
     await pingServerTime();
-    if (++n >= 6) clearInterval(fast);
-  }, 700);
+    if (++n >= 8) clearInterval(fast);
+  }, 300);
   state.timers.push(fast);
   state.timers.push(window.setInterval(pingServerTime, 15000)); // track clock drift
 }
@@ -963,7 +940,6 @@ function setupListener() {
   $<HTMLButtonElement>('#unmuteBtn').addEventListener('click', () => {
     state.unlocked = true;
     state.listenerPaused = false;
-    ensureGraph();
     $('#unmuteOverlay').hidden = true;
     void resync();
   });
