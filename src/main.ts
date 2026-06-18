@@ -22,6 +22,7 @@ import {
   Room,
   RoomEvent,
   Track,
+  AudioPresets,
   type RemoteTrack,
   type RemoteTrackPublication,
   type RemoteParticipant,
@@ -31,10 +32,29 @@ import QRCode from 'qrcode';
 
 import { icons } from './icons';
 import { Visualizer } from './visualizer';
+import { FileReceiver, sendFileChunks, newTransferId, FILE_TOPIC_PREFIX } from './transfer';
 import './style.css';
 
 const TOKEN_ENDPOINT = '/api/get-token';
 const SEEK_SECONDS = 10;
+
+// Data-channel control topic + (de)serialisers for JSON messages.
+const CTRL_TOPIC = 'smp-ctrl';
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// Quality preset -> LiveKit audio bitrate. Lower = uses less of your free bandwidth.
+type Quality = 'saver' | 'balanced' | 'hifi';
+const QUALITY_PRESET = {
+  saver: AudioPresets.speech, // ~tightest on bandwidth
+  balanced: AudioPresets.music, // good default
+  hifi: AudioPresets.musicHighQuality // best sound, most bandwidth
+} as const;
+
+// Host-side transfer/admission bookkeeping.
+const fileReceiver = new FileReceiver();
+const uploadFrom = new Map<string, string>(); // transferId -> uploader name
+const pendingJoins = new Map<string, string>(); // identity -> name awaiting admission
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
@@ -44,10 +64,13 @@ const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySe
 interface PlaylistItem {
   name: string;
   url: string;
+  by?: string; // uploader name (when added by a listener)
 }
 interface AppState {
   room: Room | null;
   isHost: boolean;
+  myName: string;
+  quality: Quality;
   audioCtx: AudioContext | null;
   hostAudioEl: HTMLAudioElement | null;
   publishedTrack: LocalAudioTrack | null;
@@ -58,10 +81,14 @@ interface AppState {
   listenerAudioEl: HTMLAudioElement | null;
   pendingRemoteTrack: RemoteTrack | null;
   currentRemoteTrack: RemoteTrack | null;
+  hostIdentity: string | null; // listener's view of who the host is (set on admit)
+  admitted: boolean; // listener has been let in
 }
 const state: AppState = {
   room: null,
   isHost: false,
+  myName: '',
+  quality: 'balanced',
   audioCtx: null,
   hostAudioEl: null,
   publishedTrack: null,
@@ -71,7 +98,9 @@ const state: AppState = {
   seeking: false,
   listenerAudioEl: null,
   pendingRemoteTrack: null,
-  currentRemoteTrack: null
+  currentRemoteTrack: null,
+  hostIdentity: null,
+  admitted: false
 };
 
 // -----------------------------------------------------------------------------
@@ -99,6 +128,16 @@ $('#app').innerHTML = /* html */ `
       <input id="hostCheckbox" type="checkbox" />
       <span>I'm the Host <small>(I'll play the music)</small></span>
     </label>
+
+    <!-- Host-only audio quality (controls the publish bitrate = your free bandwidth). -->
+    <div class="quality" id="qualityRow" hidden>
+      <span class="q-label">Audio quality <small>uses your free bandwidth</small></span>
+      <div class="seg" id="qualitySeg">
+        <button type="button" data-q="saver">Data Saver</button>
+        <button type="button" data-q="balanced" class="on">Balanced</button>
+        <button type="button" data-q="hifi">Hi-Fi</button>
+      </div>
+    </div>
 
     <button id="enterBtn" class="btn-primary">Enter Room</button>
     <p id="landingError" class="error" hidden></p>
@@ -155,6 +194,7 @@ $('#app').innerHTML = /* html */ `
     <nav class="bottom-bar">
       <button class="tab" id="addMusicBtn">${icons.add}<small>Add music</small></button>
       <button class="tab" id="inviteBtn">${icons.qr}<small>Invite</small></button>
+      <button class="tab" id="uploadBtn" hidden>${icons.add}<small>Add to queue</small></button>
       <button class="tab danger" id="leaveBtn">${icons.leave}<small>Leave</small></button>
     </nav>
 
@@ -163,6 +203,13 @@ $('#app').innerHTML = /* html */ `
          types makes the Files/iCloud picker allow them. -->
     <input
       id="fileInput"
+      type="file"
+      accept=".mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus,.aiff,.aif,.caf,audio/mpeg,audio/mp4,audio/aac,audio/wav,audio/x-wav,audio/flac,audio/ogg,audio/*"
+      multiple
+      hidden
+    />
+    <input
+      id="uploadInput"
       type="file"
       accept=".mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus,.aiff,.aif,.caf,audio/mpeg,audio/mp4,audio/aac,audio/wav,audio/x-wav,audio/flac,audio/ogg,audio/*"
       multiple
@@ -190,6 +237,30 @@ $('#app').innerHTML = /* html */ `
       <button id="copyLinkBtn" class="btn-primary">${icons.copy}<span>Copy invite link</span></button>
     </div>
   </div>
+
+  <!-- Waiting room (listener) — shown until the host admits them -->
+  <div id="waitingOverlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <div class="overlay-icon">⏳</div>
+      <h2 id="waitTitle">Asking the host to let you in…</h2>
+      <p id="waitMsg">Hang tight — the host will admit you in a moment.</p>
+      <div class="spinner" id="waitSpinner"></div>
+      <button id="cancelWaitBtn" class="btn-ghost">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Join requests queue (host) -->
+  <div id="admitOverlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <div class="overlay-icon">👋</div>
+      <h2>Join requests</h2>
+      <p>People want to join your party.</p>
+      <ul id="admitList" class="admit-list"></ul>
+    </div>
+  </div>
+
+  <!-- Transient notifications -->
+  <div id="toasts" class="toasts"></div>
 `;
 
 // Real-time spectrum visualizer painted on the artwork canvas.
@@ -205,6 +276,19 @@ enterBtn.addEventListener('click', () => {
     $<HTMLInputElement>('#nameInput').value.trim(),
     $<HTMLInputElement>('#hostCheckbox').checked
   );
+});
+
+// Show the quality selector only when "I'm the Host" is ticked.
+$<HTMLInputElement>('#hostCheckbox').addEventListener('change', (e) => {
+  $('#qualityRow').hidden = !(e.target as HTMLInputElement).checked;
+});
+$('#qualitySeg').addEventListener('click', (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-q]');
+  if (!btn) return;
+  state.quality = btn.dataset.q as Quality;
+  $('#qualitySeg')
+    .querySelectorAll('button')
+    .forEach((b) => b.classList.toggle('on', b === btn));
 });
 
 handleInviteLink();
@@ -228,6 +312,7 @@ async function joinRoom(roomName: string, participantName: string, isHost: boole
     errEl.hidden = false;
     return;
   }
+  state.myName = participantName;
   enterBtn.disabled = true;
   enterBtn.textContent = 'Connecting…';
   try {
@@ -281,33 +366,185 @@ async function connectToRoom(url: string, token: string, isHost: boolean, roomNa
     .on(RoomEvent.ParticipantConnected, updateMembers)
     .on(RoomEvent.ParticipantDisconnected, updateMembers);
 
+  // Control + file messages travel over the data channel.
+  room.on(RoomEvent.DataReceived, onData);
+
   if (!isHost) wireListenerEvents(room);
 
-  await room.connect(url, token);
+  // Listeners connect WITHOUT auto-subscribing — they receive no audio until the host
+  // admits them (we then subscribe manually). This enforces the "ask to join" gate at
+  // the media level, not just the UI.
+  await room.connect(url, token, isHost ? {} : { autoSubscribe: false });
 
-  $('#landing').hidden = true;
-  $('#player').hidden = false;
+  // Common header.
   $('#roomLabel').textContent = `#${roomName}`;
   $('#roleBadge').textContent = isHost ? 'HOST' : 'LISTENER';
   $('#roleBadge').classList.toggle('host', isHost);
-
   document.body.classList.toggle('is-listener', !isHost);
+  $<HTMLButtonElement>('#leaveBtn').addEventListener('click', () => leaveRoom());
 
   if (isHost) {
+    $('#landing').hidden = true;
+    $('#player').hidden = false;
     setupHost(roomName);
   } else {
-    // Listener view: hide host-only chrome, show the LIVE now-playing layout.
-    $('#progressRow').hidden = true;
-    $('#liveRow').hidden = false;
-    $('#content').hidden = true;
-    for (const id of ['prevBtn', 'backBtn', 'fwdBtn', 'nextBtn', 'addMusicBtn', 'inviteBtn']) {
-      $(`#${id}`).hidden = true;
-    }
-    $('#playerTitle').textContent = 'Sync Music Player';
-    $('#playerArtist').textContent = 'Connecting…';
+    // Stay behind the waiting overlay until the host admits us.
+    $('#landing').hidden = true;
+    $('#waitingOverlay').hidden = false;
+    $<HTMLButtonElement>('#cancelWaitBtn').addEventListener('click', () => leaveRoom());
+    sendCtrl({ type: 'join-request', name: state.myName });
   }
+}
 
-  $<HTMLButtonElement>('#leaveBtn').addEventListener('click', () => leaveRoom());
+// -----------------------------------------------------------------------------
+// Data channel: control messages + file chunks
+// -----------------------------------------------------------------------------
+function sendCtrl(msg: Record<string, unknown>, to?: string[]) {
+  state.room?.localParticipant.publishData(enc.encode(JSON.stringify(msg)), {
+    reliable: true,
+    topic: CTRL_TOPIC,
+    destinationIdentities: to
+  });
+}
+
+function onData(payload: Uint8Array, participant?: RemoteParticipant, _kind?: unknown, topic?: string) {
+  if (!participant) return;
+  if (topic === CTRL_TOPIC) {
+    let msg: any;
+    try {
+      msg = JSON.parse(dec.decode(payload));
+    } catch {
+      return;
+    }
+    if (state.isHost) handleHostCtrl(msg, participant);
+    else handleListenerCtrl(msg, participant);
+  } else if (state.isHost && topic?.startsWith(FILE_TOPIC_PREFIX)) {
+    handleFileChunk(topic.slice(FILE_TOPIC_PREFIX.length), new Uint8Array(payload));
+  }
+}
+
+// --- HOST: handle join requests + incoming uploads ---
+function handleHostCtrl(msg: any, participant: RemoteParticipant) {
+  if (msg.type === 'join-request') {
+    pendingJoins.set(participant.identity, msg.name || participant.name || 'Guest');
+    renderAdmitQueue();
+  } else if (msg.type === 'file-begin') {
+    fileReceiver.begin({ id: msg.id, name: msg.name, size: msg.size, mime: msg.mime });
+    uploadFrom.set(msg.id, msg.from || participant.name || 'A listener');
+    toast(`📥 ${uploadFrom.get(msg.id)} is adding “${msg.name}”…`);
+  }
+}
+
+function handleFileChunk(id: string, bytes: Uint8Array) {
+  const done = fileReceiver.push(id, bytes);
+  if (!done) return;
+  const by = uploadFrom.get(id) || 'a listener';
+  uploadFrom.delete(id);
+  // Listener-uploaded track joins the host's playlist; the HOST stays in control of playback.
+  state.playlist.push({ name: done.meta.name, url: URL.createObjectURL(done.blob), by });
+  renderPlaylist();
+  toast(`✅ Added “${done.meta.name}” from ${by}`);
+  if (state.currentIndex === -1) loadTrack(0, false);
+}
+
+function renderAdmitQueue() {
+  const list = $('#admitList');
+  if (pendingJoins.size === 0) {
+    $('#admitOverlay').hidden = true;
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = [...pendingJoins.entries()]
+    .map(
+      ([id, name]) => `
+      <li>
+        <span class="admit-name">${escapeHtml(name)}</span>
+        <span class="admit-actions">
+          <button class="admit-yes" data-id="${id}">Allow</button>
+          <button class="admit-no" data-id="${id}">Reject</button>
+        </span>
+      </li>`
+    )
+    .join('');
+  list.querySelectorAll<HTMLButtonElement>('.admit-yes').forEach((b) =>
+    b.addEventListener('click', () => respondJoin(b.dataset.id!, true))
+  );
+  list.querySelectorAll<HTMLButtonElement>('.admit-no').forEach((b) =>
+    b.addEventListener('click', () => respondJoin(b.dataset.id!, false))
+  );
+  $('#admitOverlay').hidden = false;
+}
+
+function respondJoin(identity: string, allow: boolean) {
+  const name = pendingJoins.get(identity) || 'Guest';
+  pendingJoins.delete(identity);
+  sendCtrl({ type: allow ? 'admit' : 'reject' }, [identity]);
+  toast(allow ? `✅ Let ${name} in` : `🚫 Rejected ${name}`);
+  renderAdmitQueue();
+}
+
+// --- LISTENER: handle admit / reject ---
+function handleListenerCtrl(msg: any, participant: RemoteParticipant) {
+  if (msg.type === 'admit') {
+    state.hostIdentity = participant.identity;
+    revealListenerPlayer();
+  } else if (msg.type === 'reject') {
+    $('#waitTitle').textContent = 'Host declined';
+    $('#waitMsg').textContent = "The host didn't let you in this time.";
+    $('#waitSpinner').hidden = true;
+    $<HTMLButtonElement>('#cancelWaitBtn').textContent = 'Close';
+  }
+}
+
+function revealListenerPlayer() {
+  if (state.admitted) return;
+  state.admitted = true;
+  $('#waitingOverlay').hidden = true;
+  $('#player').hidden = false;
+
+  // Listener chrome: hide host-only controls, show LIVE + the "Add to queue" tab.
+  $('#progressRow').hidden = true;
+  $('#liveRow').hidden = false;
+  $('#content').hidden = true;
+  for (const id of ['prevBtn', 'backBtn', 'fwdBtn', 'nextBtn', 'addMusicBtn', 'inviteBtn']) {
+    $(`#${id}`).hidden = true;
+  }
+  $('#uploadBtn').hidden = false;
+  $('#playerTitle').textContent = 'Sync Music Player';
+  $('#playerArtist').textContent = 'Waiting for the host to play…';
+  setupListenerUpload();
+
+  // Now that we're admitted, subscribe to the host's audio (auto-subscribe was off).
+  state.room!.remoteParticipants.forEach((p) =>
+    p.trackPublications.forEach((pub) => pub.setSubscribed(true))
+  );
+}
+
+// Listener uploads files to the host; they land in the host's playlist automatically.
+function setupListenerUpload() {
+  const input = $<HTMLInputElement>('#uploadInput');
+  $<HTMLButtonElement>('#uploadBtn').addEventListener('click', () => input.click());
+  input.addEventListener('change', async () => {
+    const files = Array.from(input.files ?? []);
+    input.value = '';
+    if (!files.length || !state.hostIdentity) return;
+    for (const file of files) {
+      const id = newTransferId();
+      sendCtrl(
+        { type: 'file-begin', id, name: file.name, size: file.size, mime: file.type, from: state.myName },
+        [state.hostIdentity]
+      );
+      toast(`⬆ Sending “${file.name}” to host…`);
+      await sendFileChunks(file, (bytes) =>
+        state.room!.localParticipant.publishData(bytes, {
+          reliable: true,
+          topic: FILE_TOPIC_PREFIX + id,
+          destinationIdentities: [state.hostIdentity!]
+        })
+      );
+      toast(`✅ “${file.name}” sent to the host`);
+    }
+  });
 }
 
 // -----------------------------------------------------------------------------
@@ -403,7 +640,10 @@ function renderPlaylist() {
       (item, i) => `
       <li class="${i === state.currentIndex ? 'active' : ''}" data-i="${i}">
         <span class="pl-art">${i === state.currentIndex ? `<span class="pl-eq"><i></i><i></i><i></i></span>` : icons.note}</span>
-        <span class="pl-name">${escapeHtml(item.name)}</span>
+        <span class="pl-text">
+          <span class="pl-name">${escapeHtml(item.name)}</span>
+          ${item.by ? `<span class="pl-by">added by ${escapeHtml(item.by)}</span>` : ''}
+        </span>
         <span class="pl-idx">${i + 1}</span>
       </li>`
     )
@@ -454,7 +694,8 @@ async function startPlayback() {
       source: Track.Source.Microphone,
       dtx: false,
       red: true,
-      stopMicTrackOnMute: false
+      stopMicTrackOnMute: false,
+      audioPreset: QUALITY_PRESET[state.quality] // bandwidth vs quality (set on landing)
     });
     state.publishedTrack = pub.audioTrack as LocalAudioTrack;
     state.graphBuilt = true;
@@ -510,6 +751,11 @@ function wireListenerEvents(room: Room) {
   state.listenerAudioEl = audioEl;
 
   const playPauseBtn = $<HTMLButtonElement>('#playPauseBtn');
+
+  // Auto-subscribe is off; once admitted, subscribe to any track the host publishes.
+  room.on(RoomEvent.TrackPublished, (pub: RemoteTrackPublication) => {
+    if (state.admitted) pub.setSubscribed(true);
+  });
 
   room.on(
     RoomEvent.TrackSubscribed,
@@ -691,4 +937,15 @@ function escapeHtml(str: string) {
   const d = document.createElement('div');
   d.textContent = str;
   return d.innerHTML;
+}
+
+function toast(text: string) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = text;
+  $('#toasts').appendChild(el);
+  setTimeout(() => {
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 300);
+  }, 3200);
 }

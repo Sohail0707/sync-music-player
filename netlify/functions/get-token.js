@@ -75,21 +75,23 @@ exports.handler = async (event) => {
   const identity = `${String(participantName).slice(0, 32)}__${Math.random().toString(36).slice(2, 8)}`;
 
   // Build the token. TTL kept reasonable for a long listening session.
+  // metadata.role lets clients discover who the host is once in the room.
   const at = new AccessToken(apiKey, apiSecret, {
     identity,
     name: participantName,
-    ttl: '6h'
+    ttl: '6h',
+    metadata: JSON.stringify({ role: isHost ? 'host' : 'listener' })
   });
 
   // Grant permissions based on role.
-  //  - Host:     can publish (broadcast the music) AND subscribe.
-  //  - Listener: can subscribe only. canPublish:false prevents listeners from
-  //              flooding the room with their own audio.
+  //  - Host:     can publish AUDIO (broadcast the music) AND subscribe.
+  //  - Listener: can NOT publish audio (no flooding the room), but CAN send data —
+  //              required for join requests + uploading files to the host's playlist.
   at.addGrant({
     roomJoin: true,
     room: String(roomName),
-    canPublish: Boolean(isHost),
-    canPublishData: Boolean(isHost), // host can send chat/data messages if you extend later
+    canPublish: Boolean(isHost), // audio/video tracks: host only
+    canPublishData: true, // data messages: everyone (join requests, file transfer)
     canSubscribe: true
   });
 
