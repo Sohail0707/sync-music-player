@@ -103,20 +103,79 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .badge.host { color: var(--accent); }
 .room-label { color: var(--muted); }
 
+.members {
+  margin-left: auto;
+  font-size: 0.85rem;
+  color: var(--muted);
+  background: var(--surface);
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
 .status {
-  width: 10px; height: 10px; border-radius: 50%; margin-left: auto;
+  width: 10px; height: 10px; border-radius: 50%;
 }
 .status.connected { background: var(--accent-2); box-shadow: 0 0 8px var(--accent-2); }
 .status.reconnecting { background: #ffcc5c; }
 .status.disconnected { background: var(--danger); }
 
-.transport { display: flex; gap: 10px; }
-.transport button { flex: 1; }
+.transport {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+}
+.transport button {
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+  font-size: 1.2rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.transport #playPauseBtn { width: 72px; height: 72px; font-size: 1.6rem; }
+
+.playlist { list-style: none; padding: 0; margin: 4px 0; max-height: 240px; overflow-y: auto; }
+.playlist li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.playlist li:hover { background: var(--surface); }
+.playlist li.active { background: var(--surface-2); color: var(--text); }
+.playlist li.active .idx { color: var(--accent-2); }
+.playlist .idx { font-size: 0.8rem; width: 18px; text-align: right; opacity: 0.7; }
+.playlist .pl-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.add-files { margin-top: 4px; }
+.now-playing.compact { text-align: center; margin: 8px 0; }
+.now-playing.compact p { font-size: 1.05rem; margin: 0 0 2px; word-break: break-all; }
+.now-playing.compact small { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.qr {
+  width: 240px;
+  max-width: 70vw;
+  border-radius: 12px;
+  background: #fff;
+  padding: 10px;
+  margin: 8px 0 16px;
+}
+.overlay-card button + button { margin-top: 10px; }
 
 .track-name { color: var(--muted); font-size: 0.9rem; margin: 4px 0; word-break: break-all; }
 .hint { color: var(--muted); font-size: 0.8rem; }
 
-.listener-status { font-size: 1rem; color: var(--accent-2); }
+.listener-status { font-size: 1rem; color: var(--accent-2); text-align: center; }
+.listener-transport { margin-top: 20px; }
+.listener-transport #listenerPlayPause { width: 72px; height: 72px; font-size: 1.6rem; }
 .now-playing { text-align: center; margin-top: 24px; }
 .now-playing p { font-size: 1.2rem; margin: 16px 0 2px; }
 .now-playing small { color: var(--muted); }
