@@ -21,3 +21,32 @@
   from = "/*"
   to = "/index.html"
   status = 200
+
+# ---- Caching policy: always serve the latest code ----
+# The entry HTML, service worker and manifest must NEVER be cached, so a new deploy is
+# picked up immediately (the SW then auto-updates the rest).
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/registerSW.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+# Hashed build assets have unique filenames per build, so they're safe to cache forever.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

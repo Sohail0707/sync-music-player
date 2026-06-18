@@ -129,6 +129,13 @@ $('#app').innerHTML = /* html */ `
       <span>I'm the Host <small>(I'll play the music)</small></span>
     </label>
 
+    <!-- iOS can't broadcast a file's audio (Safari's MediaStreamDestination is silent),
+         so warn before they try to host from an iPhone/iPad. -->
+    <p id="iosHostWarn" class="warn" hidden>
+      ⚠ iPhone/iPad can't host (Safari limitation — audio would be silent).
+      Host from a computer or Android. Your iPhone works great as a listener.
+    </p>
+
     <!-- Host-only audio quality (controls the publish bitrate = your free bandwidth). -->
     <div class="quality" id="qualityRow" hidden>
       <span class="q-label">Audio quality <small>uses your free bandwidth</small></span>
@@ -278,9 +285,16 @@ enterBtn.addEventListener('click', () => {
   );
 });
 
-// Show the quality selector only when "I'm the Host" is ticked.
+// iPadOS reports as "MacIntel" with touch, so check maxTouchPoints too.
+const isIOS =
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// Show the quality selector only when "I'm the Host" is ticked; warn iOS users.
 $<HTMLInputElement>('#hostCheckbox').addEventListener('change', (e) => {
-  $('#qualityRow').hidden = !(e.target as HTMLInputElement).checked;
+  const checked = (e.target as HTMLInputElement).checked;
+  $('#qualityRow').hidden = !checked;
+  $('#iosHostWarn').hidden = !(checked && isIOS);
 });
 $('#qualitySeg').addEventListener('click', (e) => {
   const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-q]');
@@ -762,6 +776,7 @@ function wireListenerEvents(room: Room) {
     (track: RemoteTrack, _p: RemoteTrackPublication, _x: RemoteParticipant) => {
       if (track.kind !== Track.Kind.Audio) return;
       state.pendingRemoteTrack = track; // wait for tap; no autoplay on mobile
+      applyLowLatency(track); // shrink the jitter buffer to cut delay
       $('#playerArtist').textContent = 'Host is live — tap to listen';
       $('#unmuteOverlay').hidden = false;
     }
@@ -801,6 +816,28 @@ function wireListenerEvents(room: Room) {
     if (audioEl.paused) void listenerPlay();
     else audioEl.pause();
   });
+}
+
+// Lowest reliable latency target for the receive jitter buffer, in SECONDS.
+// 0 = ask the browser to buffer as little as possible (lowest delay, but more prone to
+// glitches on unstable networks). Bump toward ~0.2 if listeners hear stutters.
+const JITTER_BUFFER_TARGET_S = 0;
+
+// Shrink the WebRTC receive jitter buffer — usually the biggest chunk of the ~300ms
+// live-stream delay. Sets both the modern (`jitterBufferTarget`, in ms) and legacy
+// (`playoutDelayHint`, in seconds) hints; both are best-effort and browser-dependent.
+function applyLowLatency(track: RemoteTrack) {
+  try {
+    const receiver = track.receiver as (RTCRtpReceiver & {
+      jitterBufferTarget?: number | null;
+      playoutDelayHint?: number;
+    }) | undefined;
+    if (!receiver) return;
+    if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = JITTER_BUFFER_TARGET_S * 1000;
+    if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = JITTER_BUFFER_TARGET_S;
+  } catch (e) {
+    console.warn('Could not lower jitter buffer on this device:', e);
+  }
 }
 
 // Build the listener's spectrum analyser from the incoming WebRTC track. We tap the

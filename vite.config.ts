@@ -36,6 +36,14 @@ export default defineConfig({
         // Precache the built static assets (HTML/JS/CSS/icons) for instant loads + offline shell.
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
 
+        // ALWAYS run the newest code: the moment a new service worker is built, activate it
+        // immediately (skipWaiting), take control of open tabs (clientsClaim), and delete the
+        // previous precache (cleanupOutdatedCaches). Combined with registerType:'autoUpdate',
+        // visitors get the latest build on their next load — no "stuck on old version".
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
+
         // CRITICAL: never let the service worker intercept real-time traffic.
         // LiveKit signalling runs over WebSockets (wss://) which Service Workers cannot
         // intercept anyway, but media/API calls over HTTP COULD be wrongly cached.
@@ -59,8 +67,11 @@ export default defineConfig({
       },
 
       devOptions: {
-        // Enable the SW in `vite dev` so you can test install/background behaviour locally.
-        enabled: true
+        // Keep the SW OFF during `vite dev` so local code changes are ALWAYS fresh
+        // (no service worker caching to fight while developing). It's still generated
+        // for production builds. Flip to true only when you specifically want to test
+        // install/offline behaviour locally.
+        enabled: false
       }
     })
   ],

@@ -82,6 +82,11 @@ input[type='text']:focus { outline: none; border-color: var(--primary); box-shad
 .btn-primary.big { width: 100%; padding: 18px; font-size: 1.05rem; }
 .btn-primary svg { width: 20px; height: 20px; }
 .error { color: var(--danger); font-size: 0.9rem; margin: 0; text-align: center; }
+.warn {
+  color: var(--orange-300); font-size: 0.85rem; line-height: 1.4; margin: 0;
+  background: rgba(255, 107, 44, 0.1); border: 1px solid rgba(255, 107, 44, 0.25);
+  padding: 12px 14px; border-radius: var(--radius);
+}
 
 .btn-ghost {
   background: transparent; border: 1px solid var(--surface-2); color: var(--text-dim);
