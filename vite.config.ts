@@ -13,9 +13,9 @@ export default defineConfig({
       // <link rel="manifest"> tag into index.html automatically. This avoids the classic
       // "two competing manifests" bug.
       manifest: {
-        name: 'Sync Music Party',
-        short_name: 'SyncParty',
-        description: 'Listen to music together, perfectly in sync, with up to 30 friends.',
+        name: 'Sync Music Player',
+        short_name: 'SMP',
+        description: 'SMP — listen to music together, perfectly in sync, with up to 30 friends.',
         theme_color: '#0c0a14',
         background_color: '#0c0a14',
         // standalone => no browser address bar; feels like a native app on iOS/Android.

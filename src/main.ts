@@ -30,6 +30,7 @@ import {
 import QRCode from 'qrcode';
 
 import { icons } from './icons';
+import { Visualizer } from './visualizer';
 import './style.css';
 
 const TOKEN_ENDPOINT = '/api/get-token';
@@ -81,7 +82,8 @@ $('#app').innerHTML = /* html */ `
   <main class="screen landing" id="landing">
     <div class="brand">
       <div class="brand-mark">${icons.note}</div>
-      <h1>Sync Party</h1>
+      <h1>Sync Music Player</h1>
+      <p class="wordmark">S·M·P</p>
       <p class="sub">Listen together, perfectly in sync.</p>
     </div>
 
@@ -117,15 +119,13 @@ $('#app').innerHTML = /* html */ `
 
     <section class="player-card">
       <div class="artwork" id="artwork">
-        <div class="art-eq" aria-hidden="true">
-          <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
-        </div>
+        <canvas class="viz" id="vizCanvas" aria-hidden="true"></canvas>
         <div class="art-icon">${icons.note}</div>
       </div>
 
       <div class="track-meta">
         <h2 id="playerTitle">Nothing playing</h2>
-        <p id="playerArtist">Live Sync Party</p>
+        <p id="playerArtist">Sync Music Player</p>
       </div>
 
       <!-- host scrubber -->
@@ -182,6 +182,9 @@ $('#app').innerHTML = /* html */ `
     </div>
   </div>
 `;
+
+// Real-time spectrum visualizer painted on the artwork canvas.
+const viz = new Visualizer($<HTMLCanvasElement>('#vizCanvas'));
 
 // -----------------------------------------------------------------------------
 // Landing + QR auto-join
@@ -291,7 +294,7 @@ async function connectToRoom(url: string, token: string, isHost: boolean, roomNa
     for (const id of ['prevBtn', 'backBtn', 'fwdBtn', 'nextBtn', 'addMusicBtn', 'inviteBtn']) {
       $(`#${id}`).hidden = true;
     }
-    $('#playerTitle').textContent = 'Live Sync Party';
+    $('#playerTitle').textContent = 'Sync Music Player';
     $('#playerArtist').textContent = 'Connecting…';
   }
 
@@ -304,6 +307,8 @@ async function connectToRoom(url: string, token: string, isHost: boolean, roomNa
 function reflectPlayback(isPlaying: boolean) {
   $('#playPauseBtn').innerHTML = isPlaying ? icons.pause : icons.play;
   $('#artwork').classList.toggle('playing', isPlaying);
+  if (isPlaying) viz.start();
+  else viz.stop();
   if ('mediaSession' in navigator) {
     navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
   }
@@ -403,8 +408,8 @@ function loadTrack(index: number, autoplay: boolean) {
   const item = state.playlist[index];
   state.hostAudioEl!.src = item.url;
   $('#playerTitle').textContent = item.name;
-  $('#playerArtist').textContent = 'Sync Party · You are hosting';
-  updateMediaMetadata(item.name, 'Live Sync Party');
+  $('#playerArtist').textContent = 'SMP · You are hosting';
+  updateMediaMetadata(item.name, 'SMP Live');
   renderPlaylist();
   if (autoplay) void startPlayback();
 }
@@ -423,6 +428,12 @@ async function startPlayback() {
     const streamDest = ctx.createMediaStreamDestination();
     sourceNode.connect(ctx.destination); // host monitors locally
     sourceNode.connect(streamDest); // broadcast tap
+
+    // Tap an analyser off the source for the live spectrum visualizer (no audible effect).
+    const analyser = ctx.createAnalyser();
+    sourceNode.connect(analyser);
+    viz.connect(analyser);
+
     const [mediaStreamTrack] = streamDest.stream.getAudioTracks();
     const pub = await room.localParticipant.publishTrack(mediaStreamTrack, {
       name: 'music',
@@ -514,12 +525,14 @@ function wireListenerEvents(room: Room) {
   });
 
   $<HTMLButtonElement>('#unmuteBtn').addEventListener('click', async () => {
-    if (!state.pendingRemoteTrack) {
+    const track = state.pendingRemoteTrack;
+    if (!track) {
       $('#unmuteOverlay').hidden = true;
       return;
     }
     await listenerPlay();
-    updateMediaMetadata('Live Sync Party', 'Host Stream');
+    setupListenerVisualizer(track); // build analyser from the incoming WebRTC stream
+    updateMediaMetadata('SMP Live', 'Host Stream');
     setupMediaSession({ play: () => void listenerPlay(), pause: () => audioEl.pause() });
     $('#unmuteOverlay').hidden = true;
   });
@@ -528,6 +541,24 @@ function wireListenerEvents(room: Room) {
     if (audioEl.paused) void listenerPlay();
     else audioEl.pause();
   });
+}
+
+// Build the listener's spectrum analyser from the incoming WebRTC track. We tap the
+// MediaStream directly (not the <audio> element) so analysing doesn't reroute or mute
+// playback. Created inside the unmute gesture, so the AudioContext is allowed to run.
+function setupListenerVisualizer(track: RemoteTrack) {
+  if (state.audioCtx) return; // build once
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    state.audioCtx = ctx;
+    const stream = new MediaStream([track.mediaStreamTrack]);
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    source.connect(analyser); // analyser only — do NOT connect to destination
+    viz.connect(analyser);
+  } catch (e) {
+    console.warn('Visualizer unavailable on this device:', e);
+  }
 }
 
 // Resume AND snap to the live edge. A paused element can buffer stale audio; detach +
@@ -609,7 +640,7 @@ function updateMediaMetadata(title: string, artist: string) {
   navigator.mediaSession.metadata = new MediaMetadata({
     title,
     artist,
-    album: 'Sync Music Party',
+    album: 'Sync Music Player',
     artwork: [
       { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
       { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png' }

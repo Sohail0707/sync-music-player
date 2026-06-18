@@ -6,6 +6,8 @@
   "description": "Synchronized real-time music listening for 20-30 friends, powered by LiveKit Cloud + Netlify.",
   "scripts": {
     "dev": "vite",
+    "icons": "node scripts/generate-icons.mjs",
+    "prebuild": "node scripts/generate-icons.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "netlify:dev": "netlify dev"
