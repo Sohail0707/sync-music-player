@@ -1,26 +1,14 @@
 // netlify/functions/_parties.js
 // -----------------------------------------------------------------------------
-// The pre-created parties (playlists). Users pick one of these — no free-form
-// room names — which caps how much you store in R2.
-//
-// Each party maps to a key PREFIX in your R2 bucket: parties/<id>/<song files>
-// Edit this list to rename / add / remove parties (keep it at ~10 to stay tidy).
+// Party registry. Names come from party-names.js (the file you edit). The KEYS
+// there are the permanent internal IDs; each maps to an R2 prefix parties/<id>/.
+// Renaming a party (its value) never changes its storage location (its key).
 // -----------------------------------------------------------------------------
 
-const PARTIES = [
-  { id: 'friday-night', name: 'Friday Night' },
-  { id: 'chill-vibes', name: 'Chill Vibes' },
-  { id: 'workout', name: 'Workout' },
-  { id: 'road-trip', name: 'Road Trip' },
-  { id: 'study', name: 'Study / Focus' },
-  { id: 'bollywood', name: 'Bollywood' },
-  { id: 'throwbacks', name: 'Throwbacks' },
-  { id: 'party-mix', name: 'Party Mix' },
-  { id: 'lofi', name: 'Lo-Fi' },
-  { id: 'late-night', name: 'Late Night' }
-];
+const NAMES = require('./party-names');
 
-const isValidParty = (id) => PARTIES.some((p) => p.id === id);
+const PARTIES = Object.entries(NAMES).map(([id, name]) => ({ id, name }));
+const isValidParty = (id) => Object.prototype.hasOwnProperty.call(NAMES, id);
 const prefixFor = (id) => `parties/${id}/`;
 
 module.exports = { PARTIES, isValidParty, prefixFor };

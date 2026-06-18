@@ -54,8 +54,13 @@ interface AppState {
   hostId: string | null; // listener's view of the host participant
   lastState: SyncState | null; // last transport state the listener received
   unlocked: boolean; // listener has tapped to allow audio
+  listenerPaused: boolean; // listener manually paused — don't auto-resume
+  admitted: boolean; // listener has been let in by the host
   timers: number[];
 }
+
+// Host-side: people awaiting admission (identity -> display name).
+const pendingJoins = new Map<string, string>();
 const state: AppState = {
   room: null,
   isHost: false,
@@ -72,6 +77,8 @@ const state: AppState = {
   hostId: null,
   lastState: null,
   unlocked: false,
+  listenerPaused: false,
+  admitted: false,
   timers: []
 };
 
@@ -174,6 +181,27 @@ $('#app').innerHTML = /* html */ `
       <h2>Join the party</h2>
       <p>Tap to start playing in sync with everyone.</p>
       <button id="unmuteBtn" class="btn-primary big">Tap to Listen in Sync</button>
+    </div>
+  </div>
+
+  <!-- Listener waiting room (until host admits) -->
+  <div id="waitingOverlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <div class="overlay-icon">⏳</div>
+      <h2 id="waitTitle">Asking the host to let you in…</h2>
+      <p id="waitMsg">Hang tight — the host will admit you in a moment.</p>
+      <div class="spinner" id="waitSpinner"></div>
+      <button id="cancelWaitBtn" class="btn-ghost">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Host join-requests queue -->
+  <div id="admitOverlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <div class="overlay-icon">👋</div>
+      <h2>Join requests</h2>
+      <p>People want to join your party.</p>
+      <ul id="admitList" class="admit-list"></ul>
     </div>
   </div>
 
@@ -329,8 +357,11 @@ async function connect(url: string, token: string) {
 
   room.on(RoomEvent.DataReceived, onData);
   if (!state.isHost) {
-    // Discover the host (for clock-ping targeting) as participants appear.
-    room.on(RoomEvent.ParticipantConnected, () => findHost());
+    // When the host appears, (re)ask to join + learn its identity for clock pings.
+    room.on(RoomEvent.ParticipantConnected, () => {
+      findHost();
+      if (!state.admitted) send({ t: 'join-request', name: state.myName });
+    });
   }
 
   await room.connect(url, token);
@@ -341,9 +372,8 @@ async function connect(url: string, token: string) {
   audioEl.preload = 'auto';
   state.audioEl = audioEl;
 
-  // Common UI.
+  // Common header.
   $('#landing').hidden = true;
-  $('#player').hidden = false;
   $('#roomLabel').textContent = `#${state.party!.name}`;
   $('#roleBadge').textContent = state.isHost ? 'HOST' : 'LISTENER';
   $('#roleBadge').classList.toggle('host', state.isHost);
@@ -355,11 +385,29 @@ async function connect(url: string, token: string) {
   $<HTMLButtonElement>('#copyLinkBtn').addEventListener('click', copyInviteLink);
 
   wireCommonAudio();
+
+  if (state.isHost) {
+    $('#player').hidden = false;
+    await refreshPlaylist();
+    setupHost();
+    setupMediaSession();
+  } else {
+    // Wait for the host's permission before entering.
+    $('#waitingOverlay').hidden = false;
+    $<HTMLButtonElement>('#cancelWaitBtn').addEventListener('click', leave);
+    send({ t: 'join-request', name: state.myName });
+  }
+}
+
+// Listener: enter the player once the host admits us.
+async function admitListener(hostIdentity: string) {
+  if (state.admitted) return;
+  state.admitted = true;
+  state.hostId = hostIdentity;
+  $('#waitingOverlay').hidden = true;
+  $('#player').hidden = false;
   await refreshPlaylist();
-
-  if (state.isHost) setupHost();
-  else setupListener();
-
+  setupListener();
   setupMediaSession();
 }
 
@@ -384,16 +432,68 @@ function onData(payload: Uint8Array, participant?: RemoteParticipant, _k?: unkno
   }
 
   if (state.isHost) {
-    // Host answers clock pings and shares current state with new arrivals.
-    if (m.t === 'clock-ping') send({ t: 'clock-pong', id: m.id, c0: m.c0, h: Date.now() }, [participant.identity]);
-    else if (m.t === 'hello') send(currentState(), [participant.identity]);
+    // Host handles join requests, clock pings, and state requests.
+    if (m.t === 'join-request') {
+      pendingJoins.set(participant.identity, m.name || participant.name || 'Guest');
+      renderAdmitQueue();
+    } else if (m.t === 'clock-ping') {
+      send({ t: 'clock-pong', id: m.id, c0: m.c0, h: Date.now() }, [participant.identity]);
+    } else if (m.t === 'hello') {
+      send(currentState(), [participant.identity]);
+    }
   } else {
-    if (m.t === 'state') applyState(m as SyncState);
+    if (m.t === 'admit') void admitListener(participant.identity);
+    else if (m.t === 'reject') {
+      $('#waitTitle').textContent = 'Host declined';
+      $('#waitMsg').textContent = "The host didn't let you in this time.";
+      $('#waitSpinner').hidden = true;
+      $<HTMLButtonElement>('#cancelWaitBtn').textContent = 'Close';
+    } else if (!state.admitted) {
+      return; // ignore everything else until admitted
+    } else if (m.t === 'state') applyState(m as SyncState);
     else if (m.t === 'clock-pong') {
       state.clock.sample(m.c0, m.h, Date.now());
       $('#syncDot').hidden = true;
     } else if (m.t === 'playlist') void refreshPlaylist().then(() => state.lastState && applyState(state.lastState));
   }
+}
+
+// --- Host: admit queue UI ---
+function renderAdmitQueue() {
+  const list = $('#admitList');
+  if (pendingJoins.size === 0) {
+    $('#admitOverlay').hidden = true;
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = [...pendingJoins.entries()]
+    .map(
+      ([id, name]) => `
+      <li>
+        <span class="admit-name">${escapeHtml(name)}</span>
+        <span class="admit-actions">
+          <button class="admit-yes" data-id="${id}">Allow</button>
+          <button class="admit-no" data-id="${id}">Reject</button>
+        </span>
+      </li>`
+    )
+    .join('');
+  list.querySelectorAll<HTMLButtonElement>('.admit-yes').forEach((b) =>
+    b.addEventListener('click', () => respondJoin(b.dataset.id!, true))
+  );
+  list.querySelectorAll<HTMLButtonElement>('.admit-no').forEach((b) =>
+    b.addEventListener('click', () => respondJoin(b.dataset.id!, false))
+  );
+  $('#admitOverlay').hidden = false;
+}
+
+function respondJoin(identity: string, allow: boolean) {
+  const name = pendingJoins.get(identity) || 'Guest';
+  pendingJoins.delete(identity);
+  send({ t: allow ? 'admit' : 'reject' }, [identity]);
+  if (allow) send(currentState(), [identity]); // give them the current state immediately
+  toast(allow ? `✅ Let ${name} in` : `🚫 Rejected ${name}`);
+  renderAdmitQueue();
 }
 
 // -----------------------------------------------------------------------------
@@ -610,26 +710,37 @@ function updateTransportEnabled() {
   $<HTMLButtonElement>('#nextBtn').disabled = !has || state.currentIndex >= state.playlist.length - 1;
 }
 
+const MAX_SONGS_PER_PARTY = 100;
+
 async function uploadFiles(files: File[]) {
   const fileInput = $<HTMLInputElement>('#fileInput');
   fileInput.value = '';
   if (!files.length) return;
+
+  let added = false;
   for (const file of files) {
+    if (state.playlist.length >= MAX_SONGS_PER_PARTY) {
+      toast(`⚠ Party is full (${MAX_SONGS_PER_PARTY} songs max)`);
+      break;
+    }
     try {
       const type = file.type || 'audio/mpeg';
       toast(`⬆ Uploading “${file.name}”…`);
-      const { url } = await api.uploadUrl(state.party!.id, file.name, type, state.hostPassword);
+      const { url } = await api.uploadUrl(state.party!.id, file.name, type, file.size, state.hostPassword);
       const put = await fetch(url, { method: 'PUT', body: file, headers: { 'Content-Type': type } });
       if (!put.ok) throw new Error(`upload failed (${put.status})`);
       toast(`✅ Added “${file.name}”`);
+      added = true;
+      await refreshPlaylist(); // keep the count current for the cap check above
     } catch (e) {
-      console.error(e);
-      toast(`⚠ Couldn't upload “${file.name}”`);
+      // Show the server's reason (file too large / party full / storage full / wrong password).
+      toast(`⚠ ${e instanceof Error ? e.message : 'Upload failed'}`);
     }
   }
-  await refreshPlaylist();
-  send({ t: 'playlist' }); // tell listeners to refetch
-  if (state.currentIndex === -1 && state.playlist.length) hostLoad(0, false);
+  if (added) {
+    send({ t: 'playlist' }); // tell listeners to refetch
+    if (state.currentIndex === -1 && state.playlist.length) hostLoad(0, false);
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -645,15 +756,20 @@ function setupListener() {
   $<HTMLButtonElement>('#playPauseBtn').addEventListener('click', () => {
     const a = state.audioEl!;
     if (a.paused) {
+      state.listenerPaused = false;
       state.unlocked = true;
       if (state.lastState) applyState(state.lastState);
-    } else a.pause();
+    } else {
+      state.listenerPaused = true; // stays paused; heartbeat won't auto-resume
+      a.pause();
+    }
   });
 
   // First gesture: unlock audio, then apply whatever the host is doing.
   $('#unmuteOverlay').hidden = false;
   $<HTMLButtonElement>('#unmuteBtn').addEventListener('click', () => {
     state.unlocked = true;
+    state.listenerPaused = false;
     ensureGraph();
     $('#unmuteOverlay').hidden = true;
     findHost();
@@ -698,7 +814,8 @@ function startClockSync() {
 
 function applyState(s: SyncState) {
   state.lastState = s;
-  if (!state.unlocked) return;
+  // Respect a manual local pause — don't let the host's heartbeat resume us.
+  if (!state.unlocked || state.listenerPaused) return;
   const a = state.audioEl!;
 
   if (!s.key) {
@@ -774,10 +891,14 @@ function setupMediaSession() {
       }
     : {
         play: () => {
+          state.listenerPaused = false;
           state.unlocked = true;
           if (state.lastState) applyState(state.lastState);
         },
-        pause: () => a.pause()
+        pause: () => {
+          state.listenerPaused = true;
+          a.pause();
+        }
       };
   for (const action of ['play', 'pause', 'nexttrack', 'previoustrack', 'seekforward', 'seekbackward'] as const) {
     try {

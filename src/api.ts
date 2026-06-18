@@ -32,10 +32,10 @@ export const api = {
       body: JSON.stringify({ roomName: party, participantName: name, isHost, password })
     }).then(jsonOrThrow) as Promise<{ token: string; url: string }>,
 
-  uploadUrl: (party: string, filename: string, contentType: string, password: string) =>
+  uploadUrl: (party: string, filename: string, contentType: string, size: number, password: string) =>
     fetch('/api/upload-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ party, filename, contentType, password })
+      body: JSON.stringify({ party, filename, contentType, size, password })
     }).then(jsonOrThrow) as Promise<{ url: string; key: string; contentType: string }>
 };

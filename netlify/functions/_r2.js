@@ -41,6 +41,20 @@ async function listPlaylist(prefix) {
     .sort((a, b) => (a.Key < b.Key ? -1 : 1));
 }
 
+// Sum the size of EVERY object in the bucket (paginated). Used to guarantee we never
+// blow past R2's free storage tier.
+async function totalBytes() {
+  const s3 = client();
+  let total = 0;
+  let token;
+  do {
+    const out = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, ContinuationToken: token }));
+    for (const o of out.Contents || []) total += o.Size || 0;
+    token = out.IsTruncated ? out.NextContinuationToken : undefined;
+  } while (token);
+  return total;
+}
+
 // Short-lived download link (browser fetches the file directly from R2; free egress).
 function presignGet(key, expiresIn = 6 * 60 * 60) {
   return getSignedUrl(client(), new GetObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn });
@@ -56,4 +70,4 @@ function presignPut(key, contentType, expiresIn = 15 * 60) {
   );
 }
 
-module.exports = { listPlaylist, presignGet, presignPut, BUCKET };
+module.exports = { listPlaylist, totalBytes, presignGet, presignPut, BUCKET };
