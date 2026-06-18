@@ -16,8 +16,8 @@ export default defineConfig({
         name: 'Sync Music Party',
         short_name: 'SyncParty',
         description: 'Listen to music together, perfectly in sync, with up to 30 friends.',
-        theme_color: '#0f0f14',
-        background_color: '#0f0f14',
+        theme_color: '#0c0a14',
+        background_color: '#0c0a14',
         // standalone => no browser address bar; feels like a native app on iOS/Android.
         display: 'standalone',
         // Lock to portrait for a phone-first experience.

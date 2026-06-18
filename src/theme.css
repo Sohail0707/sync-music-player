@@ -1,0 +1,84 @@
+/* =============================================================================
+   theme.css — SINGLE SOURCE OF TRUTH FOR COLORS, FONTS & SHAPE
+   -----------------------------------------------------------------------------
+   Change the look of the whole app from here. Nothing else needs editing.
+   Palette brief: dark · purple · orange.
+   ============================================================================= */
+
+:root {
+  /* ---- Brand palette -------------------------------------------------------*/
+  --purple-300: #c4b5fd;
+  --purple-400: #a78bfa;
+  --purple-500: #8b5cf6; /* primary */
+  --purple-600: #7c3aed;
+  --orange-300: #ffb27a;
+  --orange-400: #ff8a3d; /* accent */
+  --orange-500: #ff6b2c;
+
+  /* ---- Semantic colors (use THESE in components) ---------------------------*/
+  --bg: #0c0a14; /* app background (near-black purple) */
+  --bg-elev: #14111f; /* raised background */
+  --surface: #1b1730; /* cards */
+  --surface-2: #272040; /* inputs, chips, hover */
+  --surface-3: #322a52; /* active rows */
+
+  --text: #f5f3fb;
+  --text-dim: #b9b2d6;
+  --muted: #8c84ad;
+
+  --primary: var(--purple-500);
+  --primary-strong: var(--purple-600);
+  --accent: var(--orange-400);
+  --accent-strong: var(--orange-500);
+
+  --danger: #ff5c7c;
+  --success: #51e6b4;
+
+  /* Gradients (artwork, primary button, active controls) */
+  --grad-brand: linear-gradient(135deg, var(--purple-500), var(--orange-400));
+  --grad-art: linear-gradient(150deg, #2b1d5e 0%, var(--purple-600) 45%, var(--orange-500) 120%);
+  --grad-play: linear-gradient(135deg, var(--purple-400), var(--purple-600));
+
+  /* Glows */
+  --glow-purple: 0 8px 30px rgba(139, 92, 246, 0.45);
+  --glow-orange: 0 8px 30px rgba(255, 107, 44, 0.4);
+
+  /* ---- Typography: Apple "SF Pro" -----------------------------------------*/
+  /* On Apple devices `-apple-system` IS San Francisco (SF Pro), so this renders
+     SF Pro natively on iOS/macOS with sensible fallbacks elsewhere.
+     To force real SF Pro on ALL platforms (Android/Windows), drop the licensed
+     font files in /public/fonts and uncomment the @font-face blocks below. */
+  --font-sans: 'SF Pro Display', 'SF Pro Text', -apple-system, BlinkMacSystemFont,
+    'Inter', 'Segoe UI', Roboto, system-ui, sans-serif;
+
+  /* ---- Shape & spacing -----------------------------------------------------*/
+  --radius-sm: 10px;
+  --radius: 16px;
+  --radius-lg: 24px;
+  --radius-pill: 999px;
+
+  --app-max-width: 480px; /* mobile-first; centers on larger screens */
+}
+
+/* -----------------------------------------------------------------------------
+   OPTIONAL: self-hosted SF Pro for non-Apple platforms.
+   1) Buy/obtain the licensed SF Pro web fonts from Apple.
+   2) Put the .woff2 files in /public/fonts/.
+   3) Uncomment:
+
+@font-face {
+  font-family: 'SF Pro Display';
+  src: url('/fonts/SF-Pro-Display-Regular.woff2') format('woff2');
+  font-weight: 400; font-display: swap;
+}
+@font-face {
+  font-family: 'SF Pro Display';
+  src: url('/fonts/SF-Pro-Display-Semibold.woff2') format('woff2');
+  font-weight: 600; font-display: swap;
+}
+@font-face {
+  font-family: 'SF Pro Display';
+  src: url('/fonts/SF-Pro-Display-Bold.woff2') format('woff2');
+  font-weight: 700; font-display: swap;
+}
+----------------------------------------------------------------------------- */
