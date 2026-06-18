@@ -34,12 +34,6 @@ const CLOCK_REFRESH_MS = 30000; // occasional clock re-sync (does NOT touch audi
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-// iPadOS reports as MacIntel + touch. iOS can't route audio through Web Audio (it suspends
-// in the background), so reactive bars are desktop/Android only; iOS uses the sine fallback.
-const isIOS =
-  /iP(hone|ad|od)/.test(navigator.userAgent) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
 // -----------------------------------------------------------------------------
@@ -229,8 +223,10 @@ $('#app').innerHTML = /* html */ `
 
 const viz = new Visualizer($<HTMLCanvasElement>('#vizCanvas'));
 
-// Restart the visualizer draw loop after returning from background (rAF pauses while hidden).
+// Restart the visualizer after returning from background (rAF pauses while hidden, and the
+// AudioContext can be left suspended — resume it so the analyser + audio recover).
 function resumeViz() {
+  state.audioCtx?.resume?.().catch(() => {});
   if (state.audioEl && !state.audioEl.paused) viz.start();
 }
 document.addEventListener('visibilitychange', () => {
@@ -375,20 +371,21 @@ function unlockAudio() {
     /* ignore */
   }
 
-  // Non-iOS: set up the analyser graph for reactive bars (audio still audible).
-  if (!isIOS) {
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      state.audioCtx = ctx;
-      const src = ctx.createMediaElementSource(a);
-      const analyser = ctx.createAnalyser();
-      src.connect(analyser);
-      src.connect(ctx.destination);
-      viz.connect(analyser);
-      state.graphReady = true;
-    } catch (e) {
-      console.warn('Reactive visualizer unavailable:', e);
-    }
+  // Analyser graph for REAL reactive bars (all platforms, inside the gesture). The audio
+  // stays audible (routed to destination). If this fails or yields no data, the visualizer
+  // gracefully shows its animation instead.
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    state.audioCtx = ctx;
+    void ctx.resume().catch(() => {});
+    const src = ctx.createMediaElementSource(a);
+    const analyser = ctx.createAnalyser();
+    src.connect(analyser);
+    src.connect(ctx.destination);
+    viz.connect(analyser);
+    state.graphReady = true;
+  } catch (e) {
+    console.warn('Reactive visualizer unavailable:', e);
   }
 }
 

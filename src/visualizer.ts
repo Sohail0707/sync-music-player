@@ -68,21 +68,26 @@ export class Visualizer {
     grad.addColorStop(1, '#a78bfa');
     ctx.fillStyle = grad;
 
-    if (this.analyser) this.analyser.getByteFrequencyData(this.freq);
-    const usable = this.analyser ? Math.floor(this.freq.length * 0.85) : 0;
+    // Use REAL frequency data when it's flowing; otherwise (no analyser, or tainted/
+    // suspended so it reads all-zero) fall back to the sine animation — never blank.
+    let live = false;
+    if (this.analyser) {
+      this.analyser.getByteFrequencyData(this.freq);
+      for (let k = 0; k < this.freq.length; k++) {
+        if (this.freq[k] > 0) {
+          live = true;
+          break;
+        }
+      }
+    }
+    const usable = Math.floor(this.freq.length * 0.85);
 
     const gap = 3;
     const bw = (w - (this.BARS - 1) * gap) / this.BARS;
     for (let i = 0; i < this.BARS; i++) {
-      let level: number;
-      if (this.analyser) {
-        // REAL spectrum: low freqs (bass) on the left → highs on the right.
-        level = (this.freq[Math.floor((i / this.BARS) * usable)] / 255) ** 1.25;
-      } else {
-        // Fallback: layered sines for organic motion.
-        level =
-          (Math.sin(this.t + i * 0.5) * 0.5 + 0.5) * (Math.sin(this.t * 0.7 + i * 0.23) * 0.4 + 0.6);
-      }
+      const level = live
+        ? (this.freq[Math.floor((i / this.BARS) * usable)] / 255) ** 1.25 // bass → treble
+        : (Math.sin(this.t + i * 0.5) * 0.5 + 0.5) * (Math.sin(this.t * 0.7 + i * 0.23) * 0.4 + 0.6);
       const bh = Math.max(bw, level * h * 0.92 * this.intensity);
       roundRect(ctx, i * (bw + gap), mid - bh / 2, bw, bh, bw / 2);
       ctx.fill();
