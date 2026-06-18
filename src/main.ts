@@ -57,8 +57,23 @@ interface AppState {
   listenerPaused: boolean; // listener manually paused — don't auto-resume
   admitted: boolean; // listener has been let in by the host
   ended: boolean; // party ended by host
+  loadedKey: string | null; // track key currently loaded into the audio element
+  cmdTimer: number; // pending scheduled-command timeout id
+  lastCmd: Cmd | null; // most recent scheduled command
   timers: number[];
 }
+
+// A scheduled transport command: "be at <pos> of <key>, <playing>, exactly at host-time <at>".
+interface Cmd {
+  t: 'cmd';
+  key: string | null;
+  pos: number;
+  playing: boolean;
+  at: number; // host clock (Date.now) at which EVERY device executes
+}
+// Lead times: how far in the future to schedule, so the message reaches everyone first.
+const SAME_TRACK_LEAD = 400; // ms — play / pause / seek within the loaded track
+const NEW_TRACK_LEAD = 1200; // ms — switching tracks: extra time to buffer the new file
 
 // Host-side: people awaiting admission (identity -> display name).
 const pendingJoins = new Map<string, string>();
@@ -81,6 +96,9 @@ const state: AppState = {
   listenerPaused: false,
   admitted: false,
   ended: false,
+  loadedKey: null,
+  cmdTimer: 0,
+  lastCmd: null,
   timers: []
 };
 
@@ -464,8 +482,15 @@ function onData(payload: Uint8Array, participant?: RemoteParticipant, _k?: unkno
       $<HTMLButtonElement>('#cancelWaitBtn').textContent = 'Close';
     } else if (!state.admitted) {
       return; // ignore everything else until admitted
-    } else if (m.t === 'state') applyState(m as SyncState);
-    else if (m.t === 'clock-pong') {
+    } else if (m.t === 'cmd') {
+      // Scheduled transition — run it at the same instant as everyone else.
+      if (state.unlocked) applyScheduled(m as Cmd);
+      else state.lastCmd = m as Cmd;
+    } else if (m.t === 'state') {
+      // Heartbeat — anchors drift correction; only hard-resyncs if we're on the wrong track.
+      state.lastState = m as SyncState;
+      if (state.unlocked && !state.listenerPaused && state.loadedKey !== (m as SyncState).key) applyState(m as SyncState);
+    } else if (m.t === 'clock-pong') {
       state.clock.sample(m.c0, m.h, Date.now());
       $('#syncDot').hidden = true;
     } else if (m.t === 'playlist') void refreshPlaylist().then(() => state.lastState && applyState(state.lastState));
@@ -630,10 +655,8 @@ function setupHost() {
   fileInput.addEventListener('change', () => void uploadFiles(Array.from(fileInput.files ?? [])));
 
   $<HTMLButtonElement>('#playPauseBtn').addEventListener('click', () => {
-    const a = state.audioEl!;
-    if (state.currentIndex === -1 && state.playlist.length) hostLoad(0, true);
-    else if (a.paused) void hostPlay();
-    else a.pause();
+    if (state.audioEl!.paused) hostPlay();
+    else hostPause();
   });
   $<HTMLButtonElement>('#nextBtn').addEventListener('click', () => hostNext());
   $<HTMLButtonElement>('#prevBtn').addEventListener('click', () => hostPrev());
@@ -648,75 +671,125 @@ function setupHost() {
   });
   seek.addEventListener('change', () => {
     const a = state.audioEl!;
-    if (isFinite(a.duration)) a.currentTime = (Number(seek.value) / 1000) * a.duration;
     state.seeking = false;
-    broadcast();
+    if (isFinite(a.duration)) scheduleCommand(currentKey(), (Number(seek.value) / 1000) * a.duration, !a.paused);
   });
 
-  // Broadcast transport changes + a periodic heartbeat so late joiners/clocks stay aligned.
+  // Heartbeat: keep clocks/late-joiners aligned + anchor drift correction.
   const a = state.audioEl!;
   a.addEventListener('play', broadcast);
   a.addEventListener('pause', broadcast);
-  a.addEventListener('seeked', broadcast);
   a.addEventListener('ended', () => hostNext());
   state.timers.push(window.setInterval(broadcast, 3000));
 
-  if (state.currentIndex === -1 && state.playlist.length) hostLoad(0, false);
+  // Cue the first track (loaded, paused) so the host can just press play.
+  if (!currentKey() && state.playlist.length) prepareTrack(state.playlist[0].key);
   updateTransportEnabled();
 }
 
+function currentKey(): string | null {
+  return state.loadedKey ?? state.playlist[state.currentIndex]?.key ?? null;
+}
 function currentState(): SyncState {
   const a = state.audioEl!;
-  return {
-    t: 'state',
-    key: state.playlist[state.currentIndex]?.key ?? null,
-    pos: a.currentTime || 0,
-    playing: !a.paused,
-    h: Date.now()
-  };
+  return { t: 'state', key: currentKey(), pos: a.currentTime || 0, playing: !a.paused, h: Date.now() };
 }
 function broadcast() {
   if (state.isHost) send(currentState());
 }
 
-function hostLoad(index: number, autoplay: boolean) {
-  if (index < 0 || index >= state.playlist.length) return;
-  state.currentIndex = index;
-  const track = state.playlist[index];
-  state.audioEl!.src = track.url;
-  setMeta(track);
-  $('#playerArtist').textContent = `${state.party!.name} · You are hosting`;
-  renderPlaylist();
-  broadcast();
-  if (autoplay) void hostPlay();
+// ---------------------------------------------------------------------------
+// Scheduled-command engine (shared by host + listeners)
+//
+// The host NEVER acts immediately. It schedules a transition for `at` (a moment
+// in the near future, in host-clock time) and broadcasts it. Every device —
+// including the host — runs it at `at`, converted to its own clock via the
+// estimated offset. So nobody starts before anyone else.
+// ---------------------------------------------------------------------------
+
+// HOST: schedule + broadcast a transition.
+function scheduleCommand(key: string | null, pos: number, playing: boolean) {
+  const newTrack = !!key && key !== state.loadedKey;
+  const cmd: Cmd = { t: 'cmd', key, pos, playing, at: Date.now() + (newTrack ? NEW_TRACK_LEAD : SAME_TRACK_LEAD) };
+  send(cmd); // tell everyone
+  applyScheduled(cmd); // …and obey the same schedule ourselves
 }
-async function hostPlay() {
-  ensureGraph(); // gesture path (play button) — safe to set up Web Audio here
-  if (state.currentIndex === -1 && state.playlist.length) {
-    hostLoad(0, false);
+
+// BOTH: buffer the track now, then run the action exactly at cmd.at.
+function applyScheduled(cmd: Cmd) {
+  if (state.cmdTimer) clearTimeout(state.cmdTimer);
+  state.lastCmd = cmd;
+  if (cmd.key) prepareTrack(cmd.key); // start buffering during the lead window
+  const fireLocal = cmd.at - state.clock.offset; // host offset = 0; listeners use their estimate
+  state.cmdTimer = window.setTimeout(() => runCmd(cmd), Math.max(0, fireLocal - Date.now()));
+}
+
+// Load a track into the audio element (idempotent per key).
+function prepareTrack(key: string) {
+  if (key === state.loadedKey) return;
+  const idx = state.playlist.findIndex((t) => t.key === key);
+  if (idx < 0) {
+    void refreshPlaylist();
+    return;
   }
-  try {
-    await state.audioEl!.play();
-  } catch (e) {
-    console.error(e);
+  state.currentIndex = idx;
+  const a = state.audioEl!;
+  a.src = state.playlist[idx].url;
+  a.load();
+  state.loadedKey = key;
+  setMeta(state.playlist[idx]);
+  if (state.isHost) $('#playerArtist').textContent = `${state.party!.name} · You are hosting`;
+  renderPlaylist();
+}
+
+function runCmd(cmd: Cmd) {
+  const a = state.audioEl!;
+  state.cmdTimer = 0;
+  if (!cmd.key) {
+    a.pause();
+    if (!state.isHost) $('#playerArtist').textContent = 'Host hasn’t started yet…';
+    return;
   }
+  if (state.loadedKey !== cmd.key) prepareTrack(cmd.key);
+  const shouldPlay = cmd.playing && !(!state.isHost && state.listenerPaused);
+  const go = () => {
+    if (Math.abs(a.currentTime - cmd.pos) > 0.25) a.currentTime = Math.max(0, cmd.pos);
+    if (shouldPlay) a.play().catch(() => {});
+    else a.pause();
+    if (!state.isHost) $('#playerArtist').textContent = cmd.playing ? '🔴 In sync — live' : '⏸ Host paused';
+  };
+  if (a.readyState >= 1) go();
+  else a.addEventListener('loadedmetadata', go, { once: true });
+}
+
+// ---- Host transport: every control schedules a command ----
+function hostPlay() {
+  ensureGraph(); // gesture path — safe to set up Web Audio here
+  if (!currentKey() && state.playlist.length) prepareTrack(state.playlist[0].key);
+  scheduleCommand(currentKey(), state.audioEl!.currentTime, true);
+}
+function hostPause() {
+  // Pause everyone at the position the host WILL be at by `at` (projected forward).
+  scheduleCommand(currentKey(), state.audioEl!.currentTime + SAME_TRACK_LEAD / 1000, false);
+}
+function hostLoad(index: number, play: boolean) {
+  if (index < 0 || index >= state.playlist.length) return;
+  scheduleCommand(state.playlist[index].key, 0, play);
 }
 function hostNext() {
   if (state.currentIndex < state.playlist.length - 1) hostLoad(state.currentIndex + 1, true);
-  else state.audioEl!.pause();
+  else hostPause();
 }
 function hostPrev() {
   const a = state.audioEl!;
-  if (a.currentTime > 3 || state.currentIndex <= 0) {
-    a.currentTime = 0;
-    broadcast();
-  } else hostLoad(state.currentIndex - 1, !a.paused);
+  const playing = !a.paused;
+  if (a.currentTime > 3 || state.currentIndex <= 0) scheduleCommand(currentKey(), 0, playing);
+  else hostLoad(state.currentIndex - 1, playing);
 }
 function hostSeekBy(s: number) {
   const a = state.audioEl!;
   if (!isFinite(a.duration)) return;
-  a.currentTime = Math.max(0, Math.min(a.duration, a.currentTime + s));
-  broadcast();
+  scheduleCommand(currentKey(), Math.max(0, Math.min(a.duration, a.currentTime + s)), !a.paused);
 }
 function updateTransportEnabled() {
   const has = state.playlist.length > 0;
@@ -755,7 +828,7 @@ async function uploadFiles(files: File[]) {
   }
   if (added) {
     send({ t: 'playlist' }); // tell listeners to refetch
-    if (state.currentIndex === -1 && state.playlist.length) hostLoad(0, false);
+    if (!currentKey() && state.playlist.length) prepareTrack(state.playlist[0].key);
   }
 }
 
@@ -856,9 +929,10 @@ function applyState(s: SyncState) {
     $('#playerArtist').textContent = s.playing ? '🔴 In sync — live' : '⏸ Host paused';
   };
 
-  if (idx !== state.currentIndex || !a.src) {
+  if (idx !== state.currentIndex || state.loadedKey !== s.key || !a.src) {
     state.currentIndex = idx;
     a.src = state.playlist[idx].url;
+    state.loadedKey = s.key;
     setMeta(state.playlist[idx]);
     renderPlaylist();
     a.addEventListener('loadedmetadata', apply, { once: true });
@@ -876,7 +950,7 @@ function driftCorrect() {
   const s = state.lastState;
   const a = state.audioEl;
   if (!s || !a || !state.unlocked || !s.playing || a.paused) return;
-  if (state.playlist[state.currentIndex]?.key !== s.key) return;
+  if (state.loadedKey !== s.key) return;
 
   const target = s.pos + (state.clock.hostNow() - s.h) / 1000;
   const drift = a.currentTime - target; // +ve = we're ahead
@@ -898,8 +972,8 @@ function setupMediaSession() {
   const a = state.audioEl!;
   const handlers: Partial<Record<MediaSessionAction, () => void>> = state.isHost
     ? {
-        play: () => void hostPlay(),
-        pause: () => a.pause(),
+        play: () => hostPlay(),
+        pause: () => hostPause(),
         nexttrack: () => hostNext(),
         previoustrack: () => hostPrev(),
         seekforward: () => hostSeekBy(SEEK_SECONDS),
