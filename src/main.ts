@@ -158,7 +158,16 @@ $('#app').innerHTML = /* html */ `
       <button class="tab danger" id="leaveBtn">${icons.leave}<small>Leave</small></button>
     </nav>
 
-    <input id="fileInput" type="file" accept="audio/*" multiple hidden />
+    <!-- iOS Safari greys out audio files when accept="audio/*" alone is used (it maps the
+         wildcard to a narrow set of UTIs). Listing explicit extensions + concrete MIME
+         types makes the Files/iCloud picker allow them. -->
+    <input
+      id="fileInput"
+      type="file"
+      accept=".mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus,.aiff,.aif,.caf,audio/mpeg,audio/mp4,audio/aac,audio/wav,audio/x-wav,audio/flac,audio/ogg,audio/*"
+      multiple
+      hidden
+    />
   </main>
 
   <!-- Unmute overlay (listeners) -->
@@ -363,6 +372,11 @@ function setupHost(roomName: string) {
   audioEl.addEventListener('timeupdate', updateProgress);
   audioEl.addEventListener('loadedmetadata', updateProgress);
   audioEl.addEventListener('ended', () => playNext());
+  // Surface decode failures (e.g. an iOS-only codec the browser can't play).
+  audioEl.addEventListener('error', () => {
+    const name = state.playlist[state.currentIndex]?.name ?? 'track';
+    $('#playerArtist').textContent = `⚠ Couldn't play "${name}" — try MP3/M4A/WAV`;
+  });
 
   // Invite
   $<HTMLButtonElement>('#inviteBtn').addEventListener('click', () => openInvite(roomName));
