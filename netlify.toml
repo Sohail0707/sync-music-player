@@ -9,11 +9,11 @@
   # esbuild bundles node_modules (livekit-server-sdk) into the function automatically.
   node_bundler = "esbuild"
 
-# Pretty alias: POST /api/get-token  ->  the serverless function.
-# (The frontend uses this path; see fetchToken() in src/main.ts.)
+# Pretty alias: /api/<name> -> the matching serverless function.
+# (Frontend calls /api/parties, /api/playlist, /api/upload-url, /api/get-token.)
 [[redirects]]
-  from = "/api/get-token"
-  to = "/.netlify/functions/get-token"
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
   status = 200
 
 # SPA fallback so the PWA deep-links resolve to index.html.

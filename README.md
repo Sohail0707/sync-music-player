@@ -1,87 +1,87 @@
-# 🎧 Sync Music Party
+# 🎧 Sync Music Player (SMP)
 
-Synchronized, real-time music listening for 20–30 friends. A single **Host** streams a
-local audio file to many **Listeners** over WebRTC (LiveKit Cloud), with **background /
-lock-screen playback** on iOS Safari and Android Chrome.
+A "serverless DJ" — pick a party, and everyone hears the same playlist **in sync**, on their
+own device. Built for phones (iOS Safari + Android Chrome), installable as a PWA.
 
-- **Frontend:** Vite + vanilla TypeScript, installable PWA (`vite-plugin-pwa`)
-- **Media server:** LiveKit Cloud (free tier)
-- **Token auth:** Netlify serverless function (keys stay server-side)
+## How it works (synced local playback)
 
-> **Stack choice:** vanilla TypeScript over React. The app is one screen with two modes;
-> React would add ~40 KB and a render layer for zero benefit here. The hard parts are the
-> audio graph and Media Session lifecycle, not UI state.
-
----
-
-## How it works
+Unlike live audio streaming, **nothing is streamed**. Songs live in cloud storage; every
+device downloads and plays its **own local copy**, synchronized by a shared clock.
 
 ```
-HOST                                          LISTENER (×30)
-file -> <audio> -> Web Audio graph            LiveKit sub -> [TAP] -> track.attach(<audio>) -> play()
-                 ├─> speakers (monitor)                                    │
-                 └─> MediaStreamDestination                                └─> Media Session keeps it alive
-                        -> publishTrack() ──► LiveKit Cloud ──► subscribe
+Host picks a party ──▶ controls the timeline
+        │
+Songs in Cloudflare R2 ──(presigned download)──▶ each device plays locally
+        ▲                                              │
+   LiveKit carries ONLY tiny messages:  "play track X at position P at time T"
+                                        + clock-sync pings
 ```
 
-### Two mobile gotchas this app solves
+Why this design (it fixes everything live-streaming couldn't on iOS):
+- **iPhone can host** — plays a normal `<audio>` element, no Web Audio capture.
+- **Background playback works** for host *and* listeners.
+- **~Zero latency** — playback is local; only a clock signal crosses the network.
+- **Full audio quality** — original files, not re-encoded.
+- **LiveKit bandwidth is trivial** — it only carries small JSON messages.
 
-1. **Autoplay block** — mobile browsers refuse `audio.play()` without a user gesture.
-   Listeners get a full-screen **"Tap to Unmute & Connect"** overlay; `track.attach()` +
-   `play()` run *inside* that click. (`src/main.ts` → `wireListenerEvents`)
-2. **Background suspension** — locked/backgrounded tabs get killed. The **Media Session
-   API** with live metadata + `play`/`pause` action handlers tells the OS this is real
-   media, so it keeps the audio thread alive and shows lock-screen controls.
-   (`src/main.ts` → `setupMediaSession`)
-
-> The host uses a **Web Audio `MediaStreamAudioDestinationNode`** rather than
-> `audioElement.captureStream()` — `captureStream()` is unsupported on iOS Safari and
-> flaky elsewhere. The portable approach is to route the element through an `AudioContext`.
-
----
+## Stack
+- Vite + vanilla TypeScript, PWA (`vite-plugin-pwa`)
+- **LiveKit Cloud** — realtime control/sync channel only
+- **Cloudflare R2** — music file storage (S3-compatible, free egress)
+- **Netlify Functions** — token, party list, playlist (presigned downloads), host uploads
 
 ## Setup
 
 ### 1. LiveKit Cloud
-Create a free project at <https://cloud.livekit.io>, then copy from **Settings → Keys**:
-`API Key`, `API Secret`, and your project URL (`wss://<project>.livekit.cloud`).
+Create a project at <https://cloud.livekit.io>, copy API Key, Secret, and `wss://…` URL.
 
-### 2. Local dev
+### 2. Cloudflare R2
+Create a bucket, a CORS policy (GET/HEAD/PUT for your origins), and an S3 API token. See the
+setup notes you followed — you need: account ID, access key, secret, bucket name, S3 endpoint.
+
+### 3. Environment variables (Netlify + local `.env`)
+```
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+LIVEKIT_URL=wss://your-project.livekit.cloud
+SMP_HOST_PASSWORD=choose-a-strong-password      # only people with this can host
+R2_ACCOUNT_ID=...
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+R2_BUCKET=smp-music
+R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+```
+
+### 4. Run locally
 ```bash
 npm install
-cp .env.example .env        # fill in your 3 LiveKit values
-npm install -g netlify-cli  # one-time, gives you the function proxy
-netlify dev                 # serves the app AND /api/get-token together
+cp .env.example .env     # fill in the values above
+npm install -g netlify-cli
+netlify dev              # serves the app + all /api functions
 ```
-Open the LAN URL it prints on your **phone** to test mobile behaviour (the SW needs
-HTTPS or localhost — `netlify dev` localhost is fine; for a real phone use the deployed
-site or a tunnel).
+Test sync with **two browser windows/devices** (one host, one listener).
 
-`npm run dev` alone runs the frontend only — the token endpoint won't exist.
+### 5. Deploy
+Push to GitHub → import in Netlify (build settings come from `netlify.toml`) → add the env
+vars → deploy. Optionally point `smp.yourdomain.com` at the site.
 
-### 3. Deploy to Netlify
-1. Push to GitHub and "Import" the repo in Netlify (build settings come from `netlify.toml`).
-2. In **Site settings → Environment variables**, add:
-   `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_URL`.
-3. Deploy. Open the site on a phone and **Add to Home Screen** for fullscreen + best
-   background-audio behaviour.
-
----
+## Parties & playlists
+- The 10 parties are defined in [`netlify/functions/_parties.js`](netlify/functions/_parties.js) — edit names there.
+- Each party maps to an R2 prefix `parties/<id>/`. The **host uploads songs** (in-app, "Add songs"),
+  which land in that prefix; listeners auto-refresh.
+- Only someone with `SMP_HOST_PASSWORD` can host or upload.
 
 ## Usage
-- **Host:** check *"I am the Host"*, enter a room + nickname, pick an audio file, hit Play.
-- **Listeners:** same room name, leave the Host box unchecked, then tap the unmute overlay.
+- **Host:** pick a party, tick "Host this party", enter the password, add songs, press play.
+- **Listeners:** pick the same party (or scan the host's QR), tap "Listen in Sync".
 
-## Files
-| File | Purpose |
-|------|---------|
-| `netlify/functions/get-token.js` | Mints role-scoped LiveKit JWTs |
-| `src/main.ts` | All app logic: connect, audio pipeline, Media Session |
-| `vite.config.ts` | PWA manifest + service-worker rules (skips WS/API traffic) |
-| `netlify.toml` | Build, functions, `/api/*` redirect, SPA fallback |
-| `public/icons/*` | Placeholder PWA icons — **replace with your own art** |
+## Swapping storage providers
+All storage goes through [`netlify/functions/_r2.js`](netlify/functions/_r2.js). To move to
+S3 / Backblaze / Supabase, rewrite just that file — the app is unchanged.
 
-## Free-tier notes
-- LiveKit free tier covers this easily: 1 publisher + ~30 subscribers of a single mono/stereo
-  music track is well within bandwidth/participant limits for casual use.
-- Set music-friendly publish options are already applied (`dtx:false`, `red:true`, no AGC/NS).
+## Notes / limits
+- iOS shows a CSS pulse instead of the audio-reactive visualizer, so background playback isn't
+  broken by Web Audio (desktop/Android get the real spectrum bars).
+- LiveKit free tier is plenty here (only tiny control messages). R2 free tier: 10 GB storage,
+  free egress. Netlify legacy free: 100 GB bandwidth, 125k function calls.
+- Hosting copyrighted files in cloud storage is your legal responsibility.

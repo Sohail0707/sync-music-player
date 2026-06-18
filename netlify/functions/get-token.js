@@ -60,13 +60,23 @@ exports.handler = async (event) => {
     };
   }
 
-  const { roomName, participantName, isHost } = body;
+  const { roomName, participantName, isHost, password } = body;
 
   if (!roomName || !participantName) {
     return {
       statusCode: 400,
       headers: CORS_HEADERS,
       body: JSON.stringify({ error: 'roomName and participantName are required.' })
+    };
+  }
+
+  // Hosting is credential-protected: only someone with the host password gets the
+  // host role. Listeners join freely. This is the "only admins can be a host" gate.
+  if (isHost && password !== process.env.SMP_HOST_PASSWORD) {
+    return {
+      statusCode: 403,
+      headers: CORS_HEADERS,
+      body: JSON.stringify({ error: 'Wrong host password.' })
     };
   }
 
@@ -83,15 +93,14 @@ exports.handler = async (event) => {
     metadata: JSON.stringify({ role: isHost ? 'host' : 'listener' })
   });
 
-  // Grant permissions based on role.
-  //  - Host:     can publish AUDIO (broadcast the music) AND subscribe.
-  //  - Listener: can NOT publish audio (no flooding the room), but CAN send data —
-  //              required for join requests + uploading files to the host's playlist.
+  // Synced-DJ mode carries NO audio over LiveKit — only small sync/control messages —
+  // so nobody needs track publishing. Everyone gets data + subscribe for the control
+  // channel and presence.
   at.addGrant({
     roomJoin: true,
     room: String(roomName),
-    canPublish: Boolean(isHost), // audio/video tracks: host only
-    canPublishData: true, // data messages: everyone (join requests, file transfer)
+    canPublish: false,
+    canPublishData: true, // clock sync + transport state messages
     canSubscribe: true
   });
 
