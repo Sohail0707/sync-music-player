@@ -905,10 +905,12 @@ function askResync() {
   if (!cmd || !cmd.key || !a) return;
   if (state.loadedKey !== cmd.key) prepareTrack(cmd.key);
 
-  // Where the host is *now* = last whole-second target + time elapsed since it.
-  const liveTarget = cmd.pos + (cmd.playing ? (state.clock.hostNow() - cmd.at) / 1000 : 0);
+  // Where the host is *now* = last whole-second target + elapsed, snapped to a whole
+  // second (integer everywhere). The host's re-sync (triggered by the hello above) then
+  // tightens all devices — including the host — onto the same boundary.
+  const liveTarget = Math.max(0, Math.round(cmd.pos + (cmd.playing ? (state.clock.hostNow() - cmd.at) / 1000 : 0)));
   const go = () => {
-    a.currentTime = Math.max(0, liveTarget);
+    a.currentTime = liveTarget;
     if (cmd.playing && !state.listenerPaused) a.play().catch(() => {});
     else a.pause();
   };
@@ -936,13 +938,13 @@ function startClockSync() {
     findHost();
     if (state.hostId) send({ t: 'clock-ping', id: Math.random(), c0: Date.now() }, [state.hostId]);
   };
-  // 8 quick pings to lock on, then every 12s to track drift.
+  // 8 quick pings to lock on, then every 8s to keep tracking clock drift.
   const fast = window.setInterval(() => {
     ping();
     if (++burst >= 8) clearInterval(fast);
   }, 600);
   state.timers.push(fast);
-  state.timers.push(window.setInterval(ping, 12000));
+  state.timers.push(window.setInterval(ping, 8000));
 }
 
 // -----------------------------------------------------------------------------
