@@ -891,12 +891,29 @@ function setupListener() {
   startClockSync();
 }
 
-// Ask the host for a fresh whole-second sync (host re-syncs everyone), and apply the
-// last known command immediately so there's no dead air while we wait.
+// Listener resume / re-join. Two steps:
+//   1. Catch up to the LIVE position right now (projected from the last command via the
+//      synced clock) so playback restarts at the correct spot — no stale start, no dead air.
+//   2. Ask the host to re-sync the whole room to the next whole second, which then snaps
+//      everyone (including this device) tightly together.
 function askResync() {
   findHost();
-  send({ t: 'hello', name: state.myName });
-  if (state.lastCmd) applyScheduled(state.lastCmd);
+  send({ t: 'hello', name: state.myName }); // → host broadcastSync() to everyone
+
+  const cmd = state.lastCmd;
+  const a = state.audioEl;
+  if (!cmd || !cmd.key || !a) return;
+  if (state.loadedKey !== cmd.key) prepareTrack(cmd.key);
+
+  // Where the host is *now* = last whole-second target + time elapsed since it.
+  const liveTarget = cmd.pos + (cmd.playing ? (state.clock.hostNow() - cmd.at) / 1000 : 0);
+  const go = () => {
+    a.currentTime = Math.max(0, liveTarget);
+    if (cmd.playing && !state.listenerPaused) a.play().catch(() => {});
+    else a.pause();
+  };
+  if (a.readyState >= 1) go();
+  else a.addEventListener('loadedmetadata', go, { once: true });
 }
 
 function findHost() {
