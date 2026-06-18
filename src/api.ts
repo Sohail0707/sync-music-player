@@ -32,6 +32,20 @@ export const api = {
       body: JSON.stringify({ roomName: party, participantName: name, isHost, password })
     }).then(jsonOrThrow) as Promise<{ token: string; url: string }>,
 
+  time: () => fetch('/api/time', { cache: 'no-store' }).then(jsonOrThrow) as Promise<{ now: number }>,
+
+  getSchedule: (party: string) =>
+    fetch(`/api/schedule?party=${encodeURIComponent(party)}`, { cache: 'no-store' }).then(jsonOrThrow) as Promise<{
+      schedule: import('./sync').Schedule;
+    }>,
+
+  putSchedule: (party: string, schedule: import('./sync').Schedule, password: string) =>
+    fetch('/api/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ party, schedule, password })
+    }).then(jsonOrThrow) as Promise<{ ok: boolean }>,
+
   uploadUrl: (party: string, filename: string, contentType: string, size: number, password: string) =>
     fetch('/api/upload-url', {
       method: 'POST',

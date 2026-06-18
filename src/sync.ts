@@ -42,11 +42,13 @@ export class SyncClock {
   }
 }
 
-// Transport state the host broadcasts; listeners reconstruct playback from it.
-export interface SyncState {
-  t: 'state';
-  key: string | null; // current track key (null = nothing loaded)
-  pos: number; // playback position in seconds when sampled
+// The authoritative party schedule. Playback position is a pure function of this plus
+// the shared server clock: pos = playing ? anchorPos + (serverNow - anchorServerTime) : anchorPos.
+export interface Schedule {
+  trackKey: string | null;
+  anchorPos: number; // whole seconds
+  anchorServerTime: number; // server epoch ms at which playback was at anchorPos
   playing: boolean;
-  h: number; // host clock (Date.now()) when sampled
+  ended: boolean;
+  rev: number; // monotonic; newer wins
 }

@@ -3,19 +3,25 @@
 A "serverless DJ" — pick a party, and everyone hears the same playlist **in sync**, on their
 own device. Built for phones (iOS Safari + Android Chrome), installable as a PWA.
 
-## How it works (synced local playback)
+## How it works (server-anchored shared timeline)
 
-Unlike live audio streaming, **nothing is streamed**. Songs live in cloud storage; every
-device downloads and plays its **own local copy**, synchronized by a shared clock.
+Nothing is streamed. Songs live in cloud storage; every device downloads and plays its
+**own local copy**. Playback position is a **pure function of a shared server clock and a
+small schedule anchor** — so no device has to coordinate in real time:
 
 ```
-Host picks a party ──▶ controls the timeline
-        │
-Songs in Cloudflare R2 ──(presigned download)──▶ each device plays locally
-        ▲                                              │
-   LiveKit carries ONLY tiny messages:  "play track X at position P at time T"
-                                        + clock-sync pings
+schedule = { trackKey, anchorPos, anchorServerTime, playing }   (stored server-side)
+position = playing ? anchorPos + (serverNow − anchorServerTime) : anchorPos
 ```
+
+- **Clock = the server** (`/api/time`), not the host → the host can sleep, background, or
+  briefly drop without breaking anyone.
+- **Schedule lives on the server** (Netlify Blobs) → late joiners and devices returning
+  from background just re-read it.
+- **Every device (host included) runs the same local "follow" loop**, self-correcting to
+  the derived position. Only the host may *change* the schedule.
+- **Cloudflare R2** stores the audio (presigned downloads). **LiveKit** is used only for
+  instant push of schedule changes + presence + admission — never for timing.
 
 Why this design (it fixes everything live-streaming couldn't on iOS):
 - **iPhone can host** — plays a normal `<audio>` element, no Web Audio capture.
@@ -52,11 +58,16 @@ R2_BUCKET=smp-music
 R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
 ```
 
+> **Netlify Blobs** (used for the schedule) needs **no env vars or dashboard setup** — it's
+> automatic on Netlify. For local testing, run `netlify link` once so `netlify dev` uses the
+> right store.
+
 ### 4. Run locally
 ```bash
 npm install
 cp .env.example .env     # fill in the values above
 npm install -g netlify-cli
+netlify link             # once, so Netlify Blobs works locally
 netlify dev              # serves the app + all /api functions
 ```
 Test sync with **two browser windows/devices** (one host, one listener).
